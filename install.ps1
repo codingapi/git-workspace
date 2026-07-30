@@ -35,7 +35,9 @@ if ($Uninstall) {
 # ---- locate sources: beside this script, or clone the repo ----------------
 $SrcDir = $PSScriptRoot
 $TempDir = $null
-if (-not (Test-Path (Join-Path $SrcDir "git-workspace"))) {
+# When run via irm|iex there is no script file, so $PSScriptRoot is an empty
+# string and Join-Path would fail on it - treat that as "not beside a checkout".
+if (-not $SrcDir -or -not (Test-Path (Join-Path $SrcDir "git-workspace"))) {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Error "git is required to clone the repository"
     }
