@@ -23,5 +23,5 @@ clean: ## 删除 worktree 与投影(保留 git 缓存)
 clean-all: ## 连 git 缓存一并删除(下次 sync 重新克隆)
 	./workspace clean --all
 
-build-web: ## 在真实工作树中安装依赖并构建前端核心包
-	cd .sources/flow-frontend && pnpm i && pnpm build:flow-core
+build-web: ## 在前端装配位置安装依赖并构建核心包
+	cd flow-engine/web && pnpm i && pnpm build:flow-core

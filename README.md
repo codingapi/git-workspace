@@ -1,52 +1,47 @@
 # Workspace Projection Layer(工作区投影层)
 
-在 Git 与构建系统之间增加的一层:一份声明式 `workspace.yaml`,自动生成
-"真实 Git 工作树 + 投影逻辑工作区"。替代 Google repo 方案——repo 的
-linkfile 无法安全承载需要执行构建工具的目录(symlink 根目录与 Node 等
-工具链的 realpath 解析冲突),本方案把"可执行"与"只读视图"彻底分离。
+在 Git 与构建系统之间的一层:一份声明式 `workspace.yaml`,自动装配出
+**真实的工程树** + 可选的只读视窗。
+
+## 核心模型:仓库分两种角色
+
+- **开发型仓库**(flow-engine、flow-frontend)——工程的组成部分。真实 git
+  worktree 直接装配在工程的逻辑位置上。**IDE 打开工作区根目录,开发、构建、
+  调试都在真实目录里发生**,pnpm/maven/docker 无 symlink 问题;
+- **消费型依赖**(fastjson2)——只读输入。真实 worktree + sparse 稀疏检出
+  + 文件系统级只读锁,唯一写入者是同步工具;
+- **视窗 views**——symlink。把某仓库的子目录曝光到方便的位置(web2 =
+  apps + docs)。**只看不跑:不要在里面执行任何构建**。
 
 ```
-                 workspace.yaml
-                       │
-                       ▼
-┌──────────────────────────────────────────────┐
-│          Workspace Projection Engine         │
-│        (./workspace —— 单文件 Python)         │
-│   fetch / lock / sparse / worktree / link    │
-└───────────────┬──────────────────────────────┘
-                │
-       ┌────────┴────────┐
-       ▼                 ▼
- .sources/            product/
- Git 真实工作树        symlink 投影视图
-(执行命令的地方)      (浏览/集成用,只读)
+workspace.yaml ──▶ 投影引擎 ──▶ 真实 worktree(装配位置)+ symlink 视窗
+                     │
+        fetch / lock / sparse / worktree / guard
 ```
 
 ## 目录结构
 
 ```
 workspace/
-├── .workspace/git-cache/   bare/mirror 对象缓存(多 worktree 共享 objects)
-├── .sources/               真实 Git worktree(可独立 HEAD/sparse,可构建)
-│   ├── flow-engine/        full
-│   ├── flow-frontend/      full         ← pnpm i / build 在这里跑
-│   └── fastjson2/          sparse: core ← tag 2.0.63 钉版本
-├── product/                投影出的逻辑工作区(纯视图,禁止在此执行构建)
-│   ├── flow-engine/        entries 真实目录(后端各条目逐条链接)
-│   │   └── web/            entries 真实目录(前端各条目,排除 apps)
-│   ├── web2/               entries 真实目录(仅 apps + docs)
-│   └── third-party/fastjson2-core -> ../../.sources/fastjson2/core
-├── workspace.yaml          声明式配置(入库)
-└── workspace.lock.yaml     解析后的 commit SHA 快照(入库 → 团队精确复现)
+├── flow-engine/            ← 真实 worktree:后端(mvn 在这里执行)
+│   └── web/                ← 真实 worktree:前端,嵌套装配(pnpm 在这里执行)
+├── frameworks/fastjson2/   ← 真实 worktree:sparse core + 只读锁定
+├── web2/                   ← symlink 视窗:apps + docs(仅供浏览)
+├── app/ deploy/ tests/     ← 本地自己的代码(示例名;外层 git 跟踪)
+├── .workspace/git-cache/   ← bare/mirror 对象缓存(worktree 共享 objects)
+├── workspace.yaml          ← 声明式配置(入库)
+└── workspace.lock.yaml     ← commit SHA 锁定快照(入库 → 团队精确复现)
 ```
 
 ## 命令
 
 ```bash
-./workspace sync          # 或 make setup / make sync
-./workspace status        # 源 SHA、dirty 状态、sparse 范围、投影健康度
-./workspace clean         # 拆掉 worktree 与投影(保留缓存)
-./workspace clean --all   # 连 git 缓存一起删
+./workspace sync            # 或 make setup / make sync
+./workspace sync --locked   # 严格模式:与 lock 不一致即失败(CI/团队复现)
+./workspace status          # 源 SHA、dirty、sparse、只读状态、视窗健康度
+./workspace outdated        # 上游有无新 tag、lock 是否漂移
+./workspace guard           # 提交防护检查(由 pre-commit 钩子调用)
+./workspace clean           # 拆除 worktree 与视窗(--all 连同 git 缓存)
 ```
 
 ## workspace.yaml 语法
@@ -57,38 +52,49 @@ version: 1
 sources:
   <名字>:
     url: <git 地址>
-    revision: <分支 | tag | SHA 表达式>   # sync 时解析为 SHA 写入 lock
-    sparse: [<目录>...]                   # 可选,cone 模式(顶层文件自动保留)
-    readonly: true                        # 可选,sync 后文件系统级只读(三方源推荐)
+    revision: <分支 | tag | SHA>        # sync 时解析为 SHA 写入 lock
+    path: <工程内装配位置>               # 可嵌套(如 flow-engine/web);缺省 = 源名字
+    sparse: [<目录>...]                  # 可选,cone 模式稀疏检出
+    readonly: true                       # 可选,文件系统级只读(三方依赖推荐)
 
-projections:
+views:
   - source: <源名字>
-    from: <源内子路径,或 . 表示整仓>
-    to: <工作区内目标路径>
-    mode: symlink
-    # 可选过滤器(仅 from: . 可用;触发 entries 模式——dest 为真实目录,条目逐条链接):
-    exclude: [apps]         # 黑名单:链接其余全部;条目集 sync 时动态枚举,上游新增目录自动出现
-    include: [apps, docs]   # 白名单:只链接这些;["*"] = 全部条目(dest 随后可承载子投影)
+    from: <源内子路径>
+    to: <工作区内目标路径>               # 不得落在任何源的装配位置内
 ```
 
-## 使用规则(踩坑换来的边界认知)
+## 使用规则
 
-1. **要执行命令 → 进 `.sources/<name>` 或工作区根目录的本地代码目录**,
-   两者都是真实目录。`product/` 是 symlink 视图:只供浏览、IDE 导入、
-   查看产物。不要在 symlink 视图里跑 pnpm/maven(Node 的 realpath 机制
-   必然出错),也不要把 product/ 当 docker 构建上下文(指向 context 外的
-   symlink 会被丢弃)——docker 构建以工作区根为 context,COPY 指向
-   `.sources/...` 与本地目录。
-2. **构建产物自动穿透投影**:在 `.sources/flow-frontend` 里 build,
-   产物 `dist/` 会即时出现在 `product/web/...` 中(symlink 按路径寻址)。
-3. **lock 入库**:提交 `workspace.lock.yaml`,任何人 `git clone` 本仓库 +
-   `./workspace sync` 即可复现完全相同的 commit 组合。更新版本:改
-   `workspace.yaml` 的 revision → sync → 提交新 lock。
-4. **sparse 注意**:Git 官方提示 sparse-checkout 行为仍可能变化,某些
-   merge/rebase 或外部工具可能重新产生非 sparse 路径;`./workspace sync`
-   会重新应用 sparse 集合,也可随时 `git -C .sources/<n> sparse-checkout reapply`。
-5. **冲突保护**:投影目标已存在非投影内容(真实目录/文件/他人链接)时
-   直接报错拒绝覆盖,绝不静默破坏用户数据。
+1. **工程开发直接在装配树里进行**——全部是真实目录:IDE 打开根目录,
+   `mvn` → `flow-engine/`,`pnpm` → `flow-engine/web/`。嵌套的 `web/`
+   由引擎写入父仓库的 git exclude,不污染 flow-engine 的 status。
+2. **视窗只看不跑**:symlink 视图里执行 pnpm/maven 会因 realpath 机制
+   必然出错;docker 构建以工作区根为 context,COPY 指向 `flow-engine/...`
+   等真实路径,不要把视图当 context。
+3. **本地代码放根目录的真实目录**(如 `app/`、`deploy/`、`tests/`),
+   外层 git 跟踪,正常编辑、提交、构建。不要放进装配目录(那是他人的
+   git 工作树)或视窗(生成物,clean 即焚)。
+4. **lock 入库**:提交 `workspace.lock.yaml`,团队 `git clone` +
+   `./workspace sync --locked` 精确复现。升级 = 改 revision → sync →
+   验证 → 配置与 lock 一并提交(显式事件,不漂移)。
+5. **嵌套装配**:`path` 可位于另一源内部(如 `flow-engine/web`),引擎
+   自动处理父仓库忽略;只读源内部禁止再嵌套装配。
+
+## 只读与提交防护
+
+- **只读锁定**:`readonly: true` 的源同步后被 chmod 锁定,编辑/新建/
+  删除全部 `Permission denied`,连 `rm -rf` 都删不掉——拆除走
+  `workspace clean`(自动解锁)。唯一写入者是 `workspace sync` 自身
+  (同步时解锁、结束重新上锁,Nix store 思路)。三方改动请走上游 PR。
+- **同步安全闸**:源有未提交改动或相对上次同步点有本地提交时,sync
+  拒绝覆盖并提示处理位置。
+- **提交防护**:`.githooks/pre-commit` → `workspace guard`,按
+  workspace.yaml 动态计算受保护路径(全部装配目录 + 视窗),拦截
+  `git add -f` 强加与嵌入式 git 仓库(gitlink)。`workspace sync`
+  自动设置 `core.hooksPath`,每份克隆自动生效。装配目录对外层仓库的
+  忽略同样由引擎按配置写入 `.git/info/exclude`。
+- **外层仓库收录范围**:配置、lock、文档、工具、本地代码目录——
+  工作区的"定义、说明与自研部分",不含任何三方源码。
 
 ## 版本管理:三层模型
 
@@ -98,72 +104,15 @@ projections:
 | **产品版本** | 聚合体整体的版本号 | 外层仓库自己的 git tag | 发版 = 打 tag(tag 时刻的 lock = 完整 BOM) |
 | **生态内部版本** | 各源内部 pom/package.json 的版本号 | 各自生态工具 | 随源快照 bump 自动跟随,不用手动碰 |
 
-### 源版本:钉 tag,锁 SHA
+发版语义:外层 tag v1.0.0 时刻的 lock 钉死全部源 SHA →
+`git checkout v1.0.0 && ./workspace sync --locked` 精确复现源码组合,
+再 `mvn package` / `pnpm build` 即得制品。号码维护:后端用 maven
+`${revision}`(CI-friendly versions),前端用 `pnpm -r` 协调 bump。
 
-- `revision` 写 tag(意图,可读);lock 记 SHA(事实,精确)。无 tag 的仓库用完整 SHA + 注释。
-- 团队/CI 一律 `./workspace sync --locked`:解析与 lock 不一致即失败
-  ——同 `pnpm install --frozen-lockfile` / `cargo build --locked` 语义。
-- `./workspace outdated`:检查各源相对 lock 的漂移与上游新 tag。
+## 与 git 的关系
 
-### 升级 = 显式事件(不是漂移)
-
-任何三方的版本升级,都是一个可评审、可回滚的提交:
-
-```bash
-# 1. 改 workspace.yaml 的 revision(如 fastjson2 2.0.63 → 2.0.64)
-# 2. 接受新版本,更新 lock
-./workspace sync
-# 3. 构建 + 测试(前端 pnpm / 后端 maven)
-# 4. 配置与 lock 一起提交 —— 这个提交就是"版本升级"本身
-git commit -am "bump fastjson2 2.0.63 → 2.0.64"
-```
-
-### 产品版本:git tag 即发布
-
-外层仓库的 tag = 产品版本:tag v1.0.0 时刻的 `workspace.lock.yaml` 钉死了
-全部源的 SHA → 任何人 `git checkout v1.0.0 && ./workspace sync --locked`
-精确复现该版本的源码组合,再 `mvn package` / `pnpm build` 即得制品。
-号码维护:后端用 maven `${revision}`(CI-friendly versions),前端用
-`pnpm -r` 协调 bump,两者与外层 tag 对齐即可。
-
-## 本地代码放哪里
-
-自己写的代码(集成服务、部署配置、测试等)放在**工作区根目录下的真实目录**
-(约定如 `app/`、`deploy/`、`tests/`、`tools/`),由外层 git 仓库跟踪,
-直接编辑、提交、构建——它们是真实目录,没有任何 symlink 问题。
-
-不要放在这三处:`product/`(生成视图,clean 即焚,且被 gitignore)、
-`.sources/`(他人的 git 工作树)、`.workspace/`(工具元数据)。
-
-product/ 是"依赖的装配视图",不是代码的家;本地代码与它在根目录平级共存,
-构建脚本在两者之间编排。
-
-## 只读与提交防护
-
-**三方源文件系统级只读。** 源上配置 `readonly: true`,sync 完成后该 worktree
-被 chmod 锁定:任何编辑/新建/删除直接 `Permission denied`,唯一写入者是
-`workspace sync` 自身(同步时自动解锁、结束重新上锁,同 Nix store 思路)。
-三方代码改动请走上游(fork → 在自己的克隆中修改 → PR),不要就地改。
-
-**同步安全闸。** 某源工作树存在未提交改动、或与配置 revision 不一致的本地
-提交时,sync 拒绝覆盖并提示处理位置——防止版本切换静默丢失工作。
-
-**提交防护(pre-commit 钩子)。** `.githooks/pre-commit` 拦截两类误操作:
-
-- `git add -f` 强加受保护路径(`.sources/`、`.workspace/`、`product/`)
-- `git add -f .sources/<name>` 之类混入嵌入式 git 仓库(gitlink)
-
-`workspace sync` 自动设置 `core.hooksPath=.githooks`(每份克隆自动生效)。
-外层仓库的提交范围:配置、lock、文档、工具——即"工作区的定义与说明",
-不含任何三方源码。本地自己的代码,直接放在工作区根目录的普通文件中,
-正常编辑、正常提交。
-
-## 为什么不用 repo / submodule
-
-| | repo linkfile | submodule | 本方案 |
-|---|---|---|---|
-| 声明式布局 | ✅ | 部分 | ✅ |
-| sparse 检出 | ❌ | ❌(需手工) | ✅ per-worktree |
-| 同仓多 worktree/多视图 | 受限 | ❌ | ✅(git worktree 原生) |
-| 版本锁定 | revision | ✅ | ✅(lock 文件) |
-| 构建工具兼容 | ❌(symlink 根) | ✅ | ✅(真实工作树) |
+git 原生是单仓库工具,多仓聚合不在其职责内。本方案中所有"重活"
+(mirror、worktree、sparse-checkout、rev-parse)均为 git 原生能力,
+引擎(~700 行 Python)只做三件事:解析声明、循环调度、执行策略。
+引擎只依赖 git 的稳定 CLI 表面;真正的资产是声明式的 yaml 与 lock——
+它们平台无关,换任何语言/工具都可据此复现工程。

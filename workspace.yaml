@@ -4,44 +4,32 @@
 version: 1
 
 sources:
-  # 一律钉 tag(可读的版本快照);确无 tag 的仓库用完整 SHA + 注释说明
-  # 升级 = 改这里的 revision → sync → 验证 → 连 lock 一起提交(显式事件,不漂移)
+  # path = 真实 worktree 在工程中的装配位置(IDE 打开工程根目录即可开发/构建)
+  # 升级 = 改 revision → sync → 验证 → 连 lock 一起提交(显式事件,不漂移)
   flow-engine:
     url: git@github.com:codingapi/flow-engine.git
     revision: v0.0.66
+    path: flow-engine
 
+  # 嵌套装配:前端是后端工程的 web 部分;父仓库自动忽略该目录(不污染其 git status)
   flow-frontend:
     url: git@github.com:codingapi/flow-frontend.git
     revision: v0.0.67
+    path: flow-engine/web
 
+  # 消费型依赖:钉 tag + sparse + 文件系统只读,唯一写入者是 workspace sync
   fastjson2:
     url: git@github.com:alibaba/fastjson2.git
-    revision: 2.0.63        # tag:钉死版本,可精确复现
-    sparse: [core]          # 只检出 core 模块(cone 模式,顶层文件自动保留)
-    readonly: true          # 三方仓库:文件系统级只读,改动请走上游
+    revision: 2.0.63
+    path: frameworks/fastjson2
+    sparse: [core]
+    readonly: true
 
-projections:
-  # entries 模式(include: ["*"]):真实目录 + 全部顶层条目链接,以便承载子投影
-  - source: flow-engine
-    from: .
-    to: product/flow-engine
-    include: ["*"]
-
-  # 前端嵌入后端 web 目录:exclude 过滤(条目集 sync 时动态枚举,
-  # 上游将来新增顶层目录会自动出现,排除名单永远生效)
+# views = symlink 只读视窗(仅供浏览;不要在里面执行构建)
+views:
   - source: flow-frontend
-    from: .
-    to: product/flow-engine/web
-    exclude: [apps]
-
-  # 白名单视图:仅 apps + docs
+    from: apps
+    to: web2/apps
   - source: flow-frontend
-    from: .
-    to: product/web2
-    include: [apps, docs]
-
-  # 子路径单链接:sparse 出的 fastjson2 核心模块
-  - source: fastjson2
-    from: core
-    to: product/third-party/fastjson2-core
-    mode: symlink
+    from: docs
+    to: web2/docs
