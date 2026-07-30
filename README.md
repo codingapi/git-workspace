@@ -59,6 +59,7 @@ sources:
     url: <git 地址>
     revision: <分支 | tag | SHA 表达式>   # sync 时解析为 SHA 写入 lock
     sparse: [<目录>...]                   # 可选,cone 模式(顶层文件自动保留)
+    readonly: true                        # 可选,sync 后文件系统级只读(三方源推荐)
 
 projections:
   - source: <源名字>
@@ -82,6 +83,26 @@ projections:
    会重新应用 sparse 集合,也可随时 `git -C .sources/<n> sparse-checkout reapply`。
 5. **冲突保护**:投影目标已存在非投影内容(真实目录/文件/他人链接)时
    直接报错拒绝覆盖,绝不静默破坏用户数据。
+
+## 只读与提交防护
+
+**三方源文件系统级只读。** 源上配置 `readonly: true`,sync 完成后该 worktree
+被 chmod 锁定:任何编辑/新建/删除直接 `Permission denied`,唯一写入者是
+`workspace sync` 自身(同步时自动解锁、结束重新上锁,同 Nix store 思路)。
+三方代码改动请走上游(fork → 在自己的克隆中修改 → PR),不要就地改。
+
+**同步安全闸。** 某源工作树存在未提交改动、或与配置 revision 不一致的本地
+提交时,sync 拒绝覆盖并提示处理位置——防止版本切换静默丢失工作。
+
+**提交防护(pre-commit 钩子)。** `.githooks/pre-commit` 拦截两类误操作:
+
+- `git add -f` 强加受保护路径(`.sources/`、`.workspace/`、`product/`)
+- `git add -f .sources/<name>` 之类混入嵌入式 git 仓库(gitlink)
+
+`workspace sync` 自动设置 `core.hooksPath=.githooks`(每份克隆自动生效)。
+外层仓库的提交范围:配置、lock、文档、工具——即"工作区的定义与说明",
+不含任何三方源码。本地自己的代码,直接放在工作区根目录的普通文件中,
+正常编辑、正常提交。
 
 ## 为什么不用 repo / submodule
 

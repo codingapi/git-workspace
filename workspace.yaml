@@ -16,6 +16,7 @@ sources:
     url: https://github.com/alibaba/fastjson2.git
     revision: 2.0.63        # tag:钉死版本,可精确复现
     sparse: [core]          # 只检出 core 模块(cone 模式,顶层文件自动保留)
+    readonly: true          # 三方仓库:文件系统级只读,改动请走上游
 
 projections:
   # 后端整体暴露进产品树

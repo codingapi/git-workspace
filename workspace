@@ -110,6 +110,8 @@ def load_config() -> dict:
         for p in sparse:
             if ".." in Path(p).parts:
                 die(f"source {name}: sparse path escapes: {p}")
+        if not isinstance(src.get("readonly", False), bool):
+            die(f"source {name}: readonly must be boolean")
 
     projections = cfg.get("projections") or []
     seen_dest = []
@@ -166,31 +168,102 @@ def worktree_head(wt: Path):
         return None
 
 
-def materialize_source(name: str, sha: str, sparse: list, state: dict):
-    """创建/更新 .sources/<name> worktree,按需设置 per-worktree sparse-checkout。"""
+# ---------------------------------------------------------------- read-only lock
+
+def is_locked(wt: Path) -> bool:
+    return not os.access(str(wt), os.W_OK)
+
+
+def _chmod_no_follow(p: Path, mode: int):
+    """chmod 但绝不跟随 symlink(避免误改其他源/全局 store 的文件)。"""
+    try:
+        os.chmod(p, mode, follow_symlinks=False)
+    except (NotImplementedError, OSError):
+        if not p.is_symlink():
+            os.chmod(p, mode)
+
+
+def set_locked(wt: Path, on: bool):
+    """文件系统级只读锁:锁定后任何编辑/新建/删除都失败,只有本工具解锁后可写。"""
+    if on:
+        for dirpath, _, filenames in os.walk(wt):
+            for f in filenames:
+                p = Path(dirpath) / f
+                if not p.is_symlink():
+                    _chmod_no_follow(p, p.stat().st_mode & ~0o222)
+        for dirpath, _, _ in os.walk(wt, topdown=False):  # 目录自底向上,最后封门
+            p = Path(dirpath)
+            if not p.is_symlink():
+                _chmod_no_follow(p, p.stat().st_mode & ~0o222)
+    else:
+        for dirpath, _, _ in os.walk(wt):                # 目录自顶向下,先开门
+            p = Path(dirpath)
+            if not p.is_symlink():
+                _chmod_no_follow(p, p.stat().st_mode | 0o200)
+        for dirpath, _, filenames in os.walk(wt):
+            for f in filenames:
+                p = Path(dirpath) / f
+                if not p.is_symlink():
+                    _chmod_no_follow(p, p.stat().st_mode | 0o200)
+
+
+def ensure_hooks():
+    """外层 git 仓库自动启用 pre-commit 防护(拦截三方代码误提交)。"""
+    if not (ROOT / ".git").exists():
+        return
+    try:
+        cur = git(["config", "--get", "core.hooksPath"], cwd=ROOT)
+    except WorkspaceError:
+        cur = ""
+    if cur != ".githooks":
+        git(["config", "core.hooksPath", ".githooks"], cwd=ROOT)
+        info("pre-commit 防护钩子已启用 (core.hooksPath=.githooks)")
+
+
+def materialize_source(name: str, sha: str, sparse: list, readonly: bool, state: dict):
+    """创建/更新 .sources/<name> worktree;按需 sparse;readonly 源同步后上锁。"""
     wt = SOURCES / name
     prev = state.get("sources", {}).get(name, {})
     label = f"sparse: {', '.join(sparse)}" if sparse else "full"
+    if readonly:
+        label += ", read-only"
 
     if (wt / ".git").exists():
         head = worktree_head(wt)
         sparse_changed = sorted(prev.get("sparse", [])) != sorted(sparse)
         empty = not any(e.name != ".git" for e in wt.iterdir())
-        if head == sha and not sparse_changed:
+
+        # 安全闸:有未提交改动或本地提交时拒绝覆盖,避免静默丢失工作
+        if head != sha:
+            if git(["status", "--porcelain"], cwd=wt):
+                raise WorkspaceError(
+                    f"{name}: 工作树有未提交改动。请先在 .sources/{name} 内 "
+                    f"git commit/stash,再执行 sync"
+                )
+            ahead = git(["rev-list", "--count", f"{sha}..HEAD"], cwd=wt)
+            if ahead not in ("0", ""):
+                raise WorkspaceError(
+                    f"{name}: 存在 {ahead} 个本地提交,sync 切换版本会使其脱离。"
+                    f"请先在 .sources/{name} 内推送/处理,再执行 sync"
+                )
+
+        changed = sparse_changed or (head != sha) or empty
+        if is_locked(wt):
+            set_locked(wt, False)
+        try:
+            if sparse_changed:
+                if sparse:
+                    git(["sparse-checkout", "set", *sparse], cwd=wt)
+                else:
+                    git(["sparse-checkout", "disable"], cwd=wt)
+            if head != sha:
+                git(["checkout", "--quiet", "--detach", sha], cwd=wt)
             if empty:  # 防御:no-checkout 后未物化的空 worktree
                 git(["read-tree", "-mu", "HEAD"], cwd=wt)
-                info(f"worktree re-materialized ({label})")
-            else:
-                info(f"worktree up to date ({label})")
-            return
-        if sparse_changed:
-            if sparse:
-                git(["sparse-checkout", "set", *sparse], cwd=wt)
-            else:
-                git(["sparse-checkout", "disable"], cwd=wt)
-        if head != sha:
-            git(["checkout", "--quiet", "--detach", sha], cwd=wt)
-        info(f"worktree updated @ {sha[:12]} ({label})")
+        finally:
+            if readonly:
+                set_locked(wt, True)
+        info(f"worktree {'updated' if changed else 'up to date'} @ {sha[:12]} ({label})")
         return
 
     SOURCES.mkdir(parents=True, exist_ok=True)
@@ -202,6 +275,8 @@ def materialize_source(name: str, sha: str, sparse: list, state: dict):
         git(["read-tree", "-mu", "HEAD"], cwd=wt)
     else:
         git(["worktree", "add", "--detach", "--quiet", str(wt), sha], cwd=cache)
+    if readonly:
+        set_locked(wt, True)
     info(f"worktree created @ {sha[:12]} ({label})")
 
 
@@ -265,13 +340,19 @@ def cmd_sync(_args):
         sha = resolve_sha(cache, src["revision"])
         resolved[name] = sha
         info(f"{src['revision']}  ->  {sha}")
-        materialize_source(name, sha, src.get("sparse") or [], state)
+        materialize_source(
+            name, sha, src.get("sparse") or [], bool(src.get("readonly", False)), state
+        )
 
     step("projections")
     new_links = project_links(cfg["projections"], state)
 
     state["sources"] = {
-        name: {"sha": resolved[name], "sparse": src.get("sparse") or []}
+        name: {
+            "sha": resolved[name],
+            "sparse": src.get("sparse") or [],
+            "readonly": bool(src.get("readonly", False)),
+        }
         for name, src in cfg["sources"].items()
     }
     state["links"] = new_links
@@ -292,6 +373,7 @@ def cmd_sync(_args):
         "# Generated by `workspace sync` — 锁定各源的 commit,可提交入库以保证团队复现\n"
         + yaml.safe_dump(lock, sort_keys=False, allow_unicode=True)
     )
+    ensure_hooks()
     step(f"done. lock written: {LOCK_PATH.name}")
 
 
@@ -308,9 +390,16 @@ def cmd_status(_args):
         head = worktree_head(wt) or "?"
         dirty = git(["status", "--porcelain"], cwd=wt)
         sparse = rec.get("sparse") or []
+        ro_cfg = bool(src.get("readonly", False))
+        ro_state = "read-only" if ro_cfg else "writable"
+        if ro_cfg and not is_locked(wt):
+            ro_state = "read-only (未锁定!)"
+        dirty_state = "DIRTY" if dirty else "clean"
+        if dirty and ro_cfg:
+            dirty_state = "DIRTY(只读源出现改动?!)"
         print(
             f"  {name:<14} {head[:12]}  rev={src['revision']}"
-            f"  {'DIRTY' if dirty else 'clean'}"
+            f"  {dirty_state}  {ro_state}"
             f"  {'sparse: ' + ', '.join(sparse) if sparse else 'full'}"
         )
 
@@ -343,6 +432,8 @@ def cmd_clean(args):
         wt = SOURCES / name
         cache = CACHE / f"{name}.git"
         if (wt / ".git").exists() and cache.exists():
+            if is_locked(wt):
+                set_locked(wt, False)
             try:
                 git(["worktree", "remove", "--force", str(wt)], cwd=cache)
             except WorkspaceError:
