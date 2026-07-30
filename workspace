@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Workspace Projection Engine
+==============================
+
+在 Git 与构建系统之间的一层:声明式 workspace.yaml → 真实 Git 工作树 + 投影逻辑工作区。
+
+布局:
+    .workspace/git-cache/   bare/mirror 对象缓存(共享 objects)
+    .sources/               真实 Git worktree(可执行构建命令的地方)
+    product/                symlink 投影出的逻辑工作区(只读视图)
+    workspace.lock.yaml     解析后的 commit SHA 锁定快照
+
+命令:
+    workspace sync       拉取/更新全部源,物化 worktree(含 sparse),重建投影,写 lock
+    workspace status     查看源与投影的当前状态
+    workspace clean      删除 worktree 与投影(--all 连同 git 缓存)
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / "workspace.yaml"
+LOCK_PATH = ROOT / "workspace.lock.yaml"
+DOT = ROOT / ".workspace"
+CACHE = DOT / "git-cache"
+STATE_PATH = DOT / "state.json"
+SOURCES = ROOT / ".sources"
+
+PROTECTED_DIRS = {".workspace", ".sources", ".git"}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class WorkspaceError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def step(msg: str):
+    print(f"==> {msg}")
+
+
+def info(msg: str):
+    print(f"    {msg}")
+
+
+def die(msg: str):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def git(args, cwd=None, quiet=True):
+    """运行 git,返回 stdout。失败抛出 WorkspaceError(携带 stderr)。"""
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise WorkspaceError(f"git {' '.join(args)}\n  cwd={cwd}\n  {detail}")
+    if not quiet:
+        sys.stdout.write(proc.stdout)
+    return proc.stdout.strip()
+
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text())
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_state(state: dict):
+    DOT.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------- config
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        die(f"missing {CONFIG_PATH.name}")
+    cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+    if cfg.get("version") != 1:
+        die("workspace.yaml: unsupported version (expected: 1)")
+
+    sources = cfg.get("sources") or {}
+    if not sources:
+        die("workspace.yaml: no sources defined")
+    for name, src in sources.items():
+        if not NAME_RE.match(name):
+            die(f"source name invalid: {name!r}")
+        if not src.get("url"):
+            die(f"source {name}: missing url")
+        if not src.get("revision"):
+            die(f"source {name}: missing revision")
+        sparse = src.get("sparse") or []
+        for p in sparse:
+            if ".." in Path(p).parts:
+                die(f"source {name}: sparse path escapes: {p}")
+
+    projections = cfg.get("projections") or []
+    seen_dest = []
+    for i, p in enumerate(projections):
+        for key in ("source", "from", "to"):
+            if not p.get(key):
+                die(f"projection #{i}: missing {key}")
+        if p.get("mode", "symlink") != "symlink":
+            die(f"projection #{i}: unsupported mode {p['mode']!r} (only 'symlink')")
+        if p["source"] not in sources:
+            die(f"projection #{i}: unknown source {p['source']!r}")
+        if ".." in Path(p["from"]).parts or ".." in Path(p["to"]).parts:
+            die(f"projection #{i}: path escapes workspace")
+        top = Path(p["to"]).parts[0] if Path(p["to"]).parts else ""
+        if top in PROTECTED_DIRS:
+            die(f"projection #{i}: dest inside protected dir {top!r}")
+        # 目标互为祖先 → 冲突
+        for prev in seen_dest:
+            a, b = Path(prev), Path(p["to"])
+            if a == b or a in b.parents or b in a.parents:
+                die(f"projection #{i}: dest {p['to']!r} overlaps {prev!r}")
+        seen_dest.append(p["to"])
+
+    cfg["sources"], cfg["projections"] = sources, projections
+    return cfg
+
+
+# ---------------------------------------------------------------- sources
+
+def ensure_cache(name: str, url: str):
+    """clone --mirror 或增量更新对象缓存。"""
+    cache = CACHE / f"{name}.git"
+    if cache.exists():
+        git(["fetch", "--prune", "--quiet", "origin"], cwd=cache)
+        info("mirror updated")
+    else:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        info("mirror cloning ...")
+        git(["clone", "--mirror", "--quiet", url, str(cache)])
+    return cache
+
+
+def resolve_sha(cache: Path, revision: str) -> str:
+    out = git(["rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], cwd=cache)
+    if not out:
+        raise WorkspaceError(f"cannot resolve revision {revision!r} in {cache.name}")
+    return out
+
+
+def worktree_head(wt: Path):
+    try:
+        return git(["rev-parse", "HEAD"], cwd=wt)
+    except WorkspaceError:
+        return None
+
+
+def materialize_source(name: str, sha: str, sparse: list, state: dict):
+    """创建/更新 .sources/<name> worktree,按需设置 per-worktree sparse-checkout。"""
+    wt = SOURCES / name
+    prev = state.get("sources", {}).get(name, {})
+    label = f"sparse: {', '.join(sparse)}" if sparse else "full"
+
+    if (wt / ".git").exists():
+        head = worktree_head(wt)
+        sparse_changed = sorted(prev.get("sparse", [])) != sorted(sparse)
+        empty = not any(e.name != ".git" for e in wt.iterdir())
+        if head == sha and not sparse_changed:
+            if empty:  # 防御:no-checkout 后未物化的空 worktree
+                git(["read-tree", "-mu", "HEAD"], cwd=wt)
+                info(f"worktree re-materialized ({label})")
+            else:
+                info(f"worktree up to date ({label})")
+            return
+        if sparse_changed:
+            if sparse:
+                git(["sparse-checkout", "set", *sparse], cwd=wt)
+            else:
+                git(["sparse-checkout", "disable"], cwd=wt)
+        if head != sha:
+            git(["checkout", "--quiet", "--detach", sha], cwd=wt)
+        info(f"worktree updated @ {sha[:12]} ({label})")
+        return
+
+    SOURCES.mkdir(parents=True, exist_ok=True)
+    cache = CACHE / f"{name}.git"
+    if sparse:
+        git(["worktree", "add", "--detach", "--no-checkout", "--quiet", str(wt), sha], cwd=cache)
+        git(["sparse-checkout", "set", *sparse], cwd=wt)
+        # --no-checkout 的 index 为空,sparse-checkout set 无条目可应用,需物化一次
+        git(["read-tree", "-mu", "HEAD"], cwd=wt)
+    else:
+        git(["worktree", "add", "--detach", "--quiet", str(wt), sha], cwd=cache)
+    info(f"worktree created @ {sha[:12]} ({label})")
+
+
+# ---------------------------------------------------------------- projections
+
+def project_links(projections: list, state: dict) -> dict:
+    """创建/校正投影 symlink,清理失效链接;冲突(目标已存在非我方内容)报错。"""
+    ours = set(state.get("links", {}))
+    new_links = {}
+
+    for p in projections:
+        src = (SOURCES / p["source"] / p["from"]).resolve()
+        if not src.exists():
+            raise WorkspaceError(
+                f"projection {p['to']}: source path missing: {src} "
+                f"(sparse-checkout 可能排除了它)"
+            )
+        dest = (ROOT / p["to"])
+        rel_target = os.path.relpath(src, dest.parent)
+
+        if dest.is_symlink():
+            if os.readlink(str(dest)) == rel_target:
+                info(f"{p['to']}  ok")
+                new_links[p["to"]] = rel_target
+                continue
+            if p["to"] in ours:
+                dest.unlink()          # 我方旧链接 → 安全替换
+            else:
+                raise WorkspaceError(f"projection {p['to']}: unmanaged symlink in the way")
+        elif dest.exists():
+            raise WorkspaceError(
+                f"projection {p['to']}: refuses to overwrite existing "
+                f"{'directory' if dest.is_dir() else 'file'}"
+            )
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(rel_target, str(dest))
+        info(f"{p['to']}  ->  {rel_target}")
+        new_links[p["to"]] = rel_target
+
+    # 清理:上一轮创建、本轮配置已删除的链接
+    for old in ours - set(new_links):
+        path = ROOT / old
+        if path.is_symlink():
+            path.unlink()
+            info(f"removed stale link {old}")
+
+    return new_links
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_sync(_args):
+    cfg = load_config()
+    state = load_state()
+    resolved = {}
+
+    for name, src in cfg["sources"].items():
+        step(f"source: {name}  ({src['url']})")
+        cache = ensure_cache(name, src["url"])
+        sha = resolve_sha(cache, src["revision"])
+        resolved[name] = sha
+        info(f"{src['revision']}  ->  {sha}")
+        materialize_source(name, sha, src.get("sparse") or [], state)
+
+    step("projections")
+    new_links = project_links(cfg["projections"], state)
+
+    state["sources"] = {
+        name: {"sha": resolved[name], "sparse": src.get("sparse") or []}
+        for name, src in cfg["sources"].items()
+    }
+    state["links"] = new_links
+    save_state(state)
+
+    lock = {
+        "version": 1,
+        "sources": {
+            name: {
+                "url": src["url"],
+                "revision": src["revision"],
+                "sha": resolved[name],
+            }
+            for name, src in cfg["sources"].items()
+        },
+    }
+    LOCK_PATH.write_text(
+        "# Generated by `workspace sync` — 锁定各源的 commit,可提交入库以保证团队复现\n"
+        + yaml.safe_dump(lock, sort_keys=False, allow_unicode=True)
+    )
+    step(f"done. lock written: {LOCK_PATH.name}")
+
+
+def cmd_status(_args):
+    cfg = load_config()
+    state = load_state()
+    print("Sources:")
+    for name, src in cfg["sources"].items():
+        wt = SOURCES / name
+        rec = state.get("sources", {}).get(name, {})
+        if not (wt / ".git").exists():
+            print(f"  {name:<14} (not materialized — run `workspace sync`)")
+            continue
+        head = worktree_head(wt) or "?"
+        dirty = git(["status", "--porcelain"], cwd=wt)
+        sparse = rec.get("sparse") or []
+        print(
+            f"  {name:<14} {head[:12]}  rev={src['revision']}"
+            f"  {'DIRTY' if dirty else 'clean'}"
+            f"  {'sparse: ' + ', '.join(sparse) if sparse else 'full'}"
+        )
+
+    print("Projections:")
+    for p in cfg["projections"]:
+        dest = ROOT / p["to"]
+        if dest.is_symlink():
+            tgt = os.readlink(str(dest))
+            ok = (ROOT / p["to"]).resolve().exists()
+            print(f"  {p['to']:<28} -> {tgt}  {'ok' if ok else 'BROKEN'}")
+        elif dest.exists():
+            print(f"  {p['to']:<28} CONFLICT (real path exists, not a link)")
+        else:
+            print(f"  {p['to']:<28} missing (run `workspace sync`)")
+
+    print(f"Lock: {LOCK_PATH.name} {'present' if LOCK_PATH.exists() else 'absent'}")
+
+
+def cmd_clean(args):
+    cfg = load_config()
+    state = load_state()
+
+    for link in state.get("links", {}):
+        path = ROOT / link
+        if path.is_symlink():
+            path.unlink()
+            info(f"removed link {link}")
+
+    for name in cfg["sources"]:
+        wt = SOURCES / name
+        cache = CACHE / f"{name}.git"
+        if (wt / ".git").exists() and cache.exists():
+            try:
+                git(["worktree", "remove", "--force", str(wt)], cwd=cache)
+            except WorkspaceError:
+                import shutil
+                shutil.rmtree(wt, ignore_errors=True)
+                git(["worktree", "prune"], cwd=cache)
+            info(f"removed worktree {name}")
+
+    for d in (SOURCES, ROOT / "product"):
+        if d.exists() and not any(d.iterdir()):
+            d.rmdir()
+
+    if args.all and CACHE.exists():
+        import shutil
+        shutil.rmtree(CACHE)
+        info("removed git cache")
+
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+    step("clean done" + (" (including git cache)" if args.all else ""))
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser(prog="workspace", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("sync", help="拉取/更新源,物化 worktree,重建投影")
+    sub.add_parser("status", help="查看源与投影状态")
+    p_clean = sub.add_parser("clean", help="删除 worktree 与投影")
+    p_clean.add_argument("--all", action="store_true", help="连同 .workspace/git-cache 一起删除")
+
+    args = parser.parse_args()
+    try:
+        {"sync": cmd_sync, "status": cmd_status, "clean": cmd_clean}[args.cmd](args)
+    except WorkspaceError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

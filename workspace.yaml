@@ -1,0 +1,43 @@
+# Workspace Projection Layer 声明式配置
+# 语法见 README;修改后执行 `./workspace sync` 生效
+
+version: 1
+
+sources:
+  flow-engine:
+    url: https://github.com/codingapi/flow-engine.git
+    revision: refs/heads/main
+
+  flow-frontend:
+    url: https://github.com/codingapi/flow-frontend.git
+    revision: refs/heads/main
+
+  fastjson2:
+    url: https://github.com/alibaba/fastjson2.git
+    revision: 2.0.63        # tag:钉死版本,可精确复现
+    sparse: [core]          # 只检出 core 模块(cone 模式,顶层文件自动保留)
+
+projections:
+  # 后端整体暴露进产品树
+  - source: flow-engine
+    from: .
+    to: product/flow-engine
+    mode: symlink
+
+  # 前端整体 = 后端的 web
+  - source: flow-frontend
+    from: .
+    to: product/web
+    mode: symlink
+
+  # 子路径投影:文档单独曝光
+  - source: flow-frontend
+    from: docs
+    to: product/docs
+    mode: symlink
+
+  # sparse + 子路径投影:仅 fastjson2 核心模块
+  - source: fastjson2
+    from: core
+    to: product/third-party/fastjson2-core
+    mode: symlink

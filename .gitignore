@@ -1,19 +1,10 @@
-# ===== repo 工具元数据 =====
-.repo/
+# ===== 投影层生成物(由 ./workspace sync 管理,永不入库)=====
+.workspace/
+.sources/
+product/
 
-# ===== repo 管理的所有子仓库(各自有独立 git 历史,不由外层跟踪)=====
-/flow-engine/
-/web2/
-/frameworks/
-/sources/
-/.sources/
-
-# ===== 清单仓库(自身就是独立 git 仓库,单独版本化)=====
-/manifests/
-
-# ===== 本机私有内容(不入库)=====
-/local/
-*.local
+# ===== 通用 =====
+node_modules/
 .DS_Store
-.idea/
-.vscode/
+*.local
+.claude/

@@ -1,20 +1,21 @@
-# 聚合工作区的一键入口
-# 共享给团队时,把 MANIFEST_URL 改成 GitHub 上的清单仓库地址
-MANIFEST_URL ?= file://$(CURDIR)/manifests
+# 工作区投影层的一键入口(实际能力由 ./workspace 提供)
 
-.PHONY: setup sync status forall
+.PHONY: setup sync status clean clean-all build-web
 
-setup: ## 首次初始化:按清单拉取所有仓库(linkfile 由 repo 自动生成)
-	repo init -u $(MANIFEST_URL) -b main -m default.xml
-	repo sync -j8
-	@# 嵌套的 web/ 在外层 flow-engine 里会显示未跟踪,本地忽略(不污染上游)
-	@grep -q '^web/$$' flow-engine/.git/info/exclude 2>/dev/null || echo 'web/' >> flow-engine/.git/info/exclude
+setup: ## 首次初始化:拉取全部源 + 物化 worktree + 建立投影
+	./workspace sync
 
-sync: ## 同步所有子仓库(linkfile 链接自动重建)
-	repo sync -j8
+sync: ## 同步:更新缓存、重解析 revision、校正 worktree 与投影
+	./workspace sync
 
-status: ## 查看所有子仓库的改动状态
-	repo status
+status: ## 查看源与投影状态
+	./workspace status
 
-forall: ## 对所有子仓库执行命令,如 make forall CMD='git pull'
-	repo forall -c '$(CMD)'
+clean: ## 删除 worktree 与投影(保留 git 缓存)
+	./workspace clean
+
+clean-all: ## 连 git 缓存一并删除(下次 sync 重新克隆)
+	./workspace clean --all
+
+build-web: ## 在真实工作树中安装依赖并构建前端核心包
+	cd .sources/flow-frontend && pnpm i && pnpm build:flow-core
