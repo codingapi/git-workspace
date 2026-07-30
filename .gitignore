@@ -5,6 +5,8 @@
 /flow-engine/
 /web2/
 /frameworks/
+/sources/
+/.sources/
 
 # ===== 清单仓库(自身就是独立 git 仓库,单独版本化)=====
 /manifests/
