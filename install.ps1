@@ -32,15 +32,36 @@ if ($Uninstall) {
     exit 0
 }
 
+# ---- preflight: required dependencies (git, python) ----------------------
+# Checked up front so every missing dependency is reported clearly, together,
+# before any work (cloning, copying) is done. git is needed both to clone in
+# standalone mode and by git-workspace itself at runtime; python runs the CLI.
+$PyExe = $null
+$PyArgs = @()
+$missing = @()
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    $missing += "git     - install Git for Windows: https://git-scm.com"
+}
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    $PyExe = "python"
+} elseif (Get-Command py -ErrorAction SilentlyContinue) {
+    $PyExe = "py"
+    $PyArgs = @("-3")
+} else {
+    $missing += "python  - install Python 3.8+: https://python.org"
+}
+if ($missing.Count -gt 0) {
+    Write-Host "error: missing required dependencies:" -ForegroundColor Red
+    foreach ($m in $missing) { Write-Host "  $m" -ForegroundColor Red }
+    exit 1
+}
+
 # ---- locate sources: beside this script, or clone the repo ----------------
 $SrcDir = $PSScriptRoot
 $TempDir = $null
 # When run via irm|iex there is no script file, so $PSScriptRoot is an empty
 # string and Join-Path would fail on it - treat that as "not beside a checkout".
 if (-not $SrcDir -or -not (Test-Path (Join-Path $SrcDir "git-workspace"))) {
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-Error "git is required to clone the repository"
-    }
     $TempDir = Join-Path $env:TEMP "git-workspace-install"
     if (Test-Path $TempDir) { Remove-Item -Recurse -Force $TempDir }
     # install from the latest release tag, not the development branch
@@ -62,22 +83,7 @@ if (-not $SrcDir -or -not (Test-Path (Join-Path $SrcDir "git-workspace"))) {
 }
 
 try {
-    # ---- dependency checks: python (or py launcher), git, PyYAML ----------
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-Error "git not found - install Git for Windows (https://git-scm.com)"
-    }
-
-    $PyExe = $null
-    $PyArgs = @()
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        $PyExe = "python"
-    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
-        $PyExe = "py"
-        $PyArgs = @("-3")
-    } else {
-        Write-Error "python not found - install Python 3.8+ (https://python.org)"
-    }
-
+    # ---- dependency check: PyYAML (git + python verified in preflight) ----
     # Native commands emit diagnostics on stderr. With $ErrorActionPreference
     # = "Stop", Windows PowerShell 5.1 turns that stderr into a *terminating*
     # NativeCommandError, which would abort the installer the moment the probe

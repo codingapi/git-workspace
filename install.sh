@@ -61,13 +61,25 @@ case "$OS" in
         ;;
 esac
 
+# ---- preflight: required dependencies (git, python3) ---------------------
+# Checked up front so every missing dependency is reported together before any
+# work is done. git is needed to clone (standalone mode) and at runtime;
+# python3 runs the CLI.
+MISSING=""
+command -v git >/dev/null 2>&1 || MISSING="$MISSING git"
+command -v python3 >/dev/null 2>&1 || MISSING="$MISSING python3"
+if [ -n "$MISSING" ]; then
+    echo "error: missing required dependencies:$MISSING" >&2
+    echo "  git      -> https://git-scm.com" >&2
+    echo "  python3  -> https://python.org (Python 3.8+)" >&2
+    exit 1
+fi
+
 # ---- locate sources: beside this script, or clone the repo (curl|sh mode)
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SRC_DIR="$SCRIPT_DIR"
 TMP_CLONE=""
 if [ ! -f "$SRC_DIR/git-workspace" ]; then
-    command -v git >/dev/null 2>&1 || {
-        echo "error: git is required to clone the repository" >&2; exit 1; }
     TMP_CLONE=$(mktemp -d)
     trap 'rm -rf "$TMP_CLONE"' EXIT
     # install from the latest release tag, not the development branch
@@ -84,11 +96,7 @@ if [ ! -f "$SRC_DIR/git-workspace" ]; then
     SRC_DIR="$TMP_CLONE"
 fi
 
-# ---- dependency checks: python3, git, PyYAML ------------------------------
-command -v python3 >/dev/null 2>&1 || {
-    echo "error: python3 not found — install Python 3.8+" >&2; exit 1; }
-command -v git >/dev/null 2>&1 || {
-    echo "error: git not found" >&2; exit 1; }
+# ---- dependency check: PyYAML (git + python3 verified in preflight) -------
 if ! python3 -c "import yaml" >/dev/null 2>&1; then
     echo "==> PyYAML missing — attempting: python3 -m pip install --user pyyaml"
     python3 -m pip install --user pyyaml || {
