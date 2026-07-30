@@ -155,12 +155,42 @@ def load_config() -> dict:
         top = Path(p["to"]).parts[0] if Path(p["to"]).parts else ""
         if top in PROTECTED_DIRS:
             die(f"projection #{i}: dest inside protected dir {top!r}")
-        # 目标互为祖先 → 冲突
-        for prev in seen_dest:
-            a, b = Path(prev), Path(p["to"])
-            if a == b or a in b.parents or b in a.parents:
-                die(f"projection #{i}: dest {p['to']!r} overlaps {prev!r}")
-        seen_dest.append(p["to"])
+        # 过滤器校验:exclude/include 仅在 from: . 时可用(entries 模式)
+        exclude = p.get("exclude") or []
+        include = p.get("include")
+        if (not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude)):
+            die(f"projection #{i}: exclude must be a list of strings")
+        if include is not None and (
+            not isinstance(include, list) or not include
+            or not all(isinstance(x, str) for x in include)
+        ):
+            die(f"projection #{i}: include must be a non-empty list of strings (or ['*'])")
+        if (exclude or include is not None) and p["from"] != ".":
+            die(f"projection #{i}: exclude/include only supported with 'from: .'")
+
+    # 目标冲突/嵌套规则:子投影只能落在 entries 模式(带过滤器)的父投影内
+    entries_dests = {
+        p["to"] for p in projections
+        if (p.get("exclude") or p.get("include") is not None)
+    }
+    seen = []
+    for i, p in enumerate(projections):
+        to = Path(p["to"])
+        is_entries = p["to"] in entries_dests
+        for prev, prev_entries in seen:
+            if to == prev:
+                die(f"projection #{i}: duplicate dest {p['to']!r}")
+            if prev in to.parents and not prev_entries:
+                die(
+                    f"projection #{i}: {p['to']!r} 嵌套在整目录链接 {str(prev)!r} 之下 —— "
+                    f"请给父投影加 include/exclude 使其成为 entries 模式"
+                )
+            if to in prev.parents and not is_entries:
+                die(
+                    f"projection #{i}: {p['to']!r} 是已有投影 {str(prev)!r} 的祖先目录,"
+                    f"整目录链接之上不能再挂投影"
+                )
+        seen.append((to, is_entries))
 
     cfg["sources"], cfg["projections"] = sources, projections
     return cfg
@@ -313,40 +343,80 @@ def materialize_source(name: str, sha: str, sparse: list, readonly: bool, state:
 
 # ---------------------------------------------------------------- projections
 
+def _link_one(src: Path, dest: Path, rel_dest: str, ours: set, new_links: dict):
+    """创建/校正单条投影链接;冲突(非我方内容)拒绝覆盖。"""
+    rel_target = os.path.relpath(src, dest.parent)
+    if dest.is_symlink():
+        if os.readlink(str(dest)) == rel_target:
+            new_links[rel_dest] = rel_target
+            return
+        if rel_dest in ours:
+            dest.unlink()  # 我方旧链接 → 安全替换
+        else:
+            raise WorkspaceError(f"projection {rel_dest}: 非托管 symlink 占位,拒绝覆盖")
+    elif dest.exists():
+        raise WorkspaceError(
+            f"projection {rel_dest}: refuses to overwrite existing "
+            f"{'directory' if dest.is_dir() else 'file'}"
+        )
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(rel_target, str(dest))
+    new_links[rel_dest] = rel_target
+
+
 def project_links(projections: list, state: dict) -> dict:
-    """创建/校正投影 symlink,清理失效链接;冲突(目标已存在非我方内容)报错。"""
+    """创建/校正投影,清理失效链接。
+
+    两种形态:
+    - 单链接:from 子路径或整目录 → dest 是一条 symlink
+    - entries 模式(带 exclude/include):dest 是真实目录,内含逐条链接;
+      条目集合在 sync 时从源目录动态枚举,上游新增顶层目录下次 sync 自动出现
+    """
     ours = set(state.get("links", {}))
     new_links = {}
 
-    for p in projections:
-        src = (SOURCES / p["source"] / p["from"]).resolve()
-        if not src.exists():
+    # 父目录先建:按目标深度排序
+    for p in sorted(projections, key=lambda p: len(Path(p["to"]).parts)):
+        src_base = SOURCES / p["source"] / p["from"]
+        if not src_base.exists():
             raise WorkspaceError(
-                f"projection {p['to']}: source path missing: {src} "
+                f"projection {p['to']}: source path missing: {src_base} "
                 f"(sparse-checkout 可能排除了它)"
             )
-        dest = (ROOT / p["to"])
-        rel_target = os.path.relpath(src, dest.parent)
+        include = p.get("include")
+        exclude = set(p.get("exclude") or [])
 
-        if dest.is_symlink():
-            if os.readlink(str(dest)) == rel_target:
-                info(f"{p['to']}  ok")
-                new_links[p["to"]] = rel_target
-                continue
-            if p["to"] in ours:
-                dest.unlink()          # 我方旧链接 → 安全替换
+        if include is not None or exclude:
+            # entries 模式:真实目录 + 逐条链接
+            names = sorted(e for e in os.listdir(src_base) if e != ".git")
+            if include is not None:
+                missing = (set(include) - {"*"}) - set(names)
+                if missing:
+                    raise WorkspaceError(
+                        f"projection {p['to']}: include 的条目不存在: {', '.join(sorted(missing))}"
+                    )
+                wanted = names if include == ["*"] else [n for n in names if n in set(include)]
+                flt = f"include {include}"
             else:
-                raise WorkspaceError(f"projection {p['to']}: unmanaged symlink in the way")
-        elif dest.exists():
-            raise WorkspaceError(
-                f"projection {p['to']}: refuses to overwrite existing "
-                f"{'directory' if dest.is_dir() else 'file'}"
-            )
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(rel_target, str(dest))
-        info(f"{p['to']}  ->  {rel_target}")
-        new_links[p["to"]] = rel_target
+                wanted = [n for n in names if n not in exclude]
+                flt = f"exclude {sorted(exclude)}" if exclude else "全部条目"
+            dest_dir = ROOT / p["to"]
+            if dest_dir.is_symlink():
+                if p["to"] in ours:
+                    dest_dir.unlink()
+                else:
+                    raise WorkspaceError(f"projection {p['to']}: 非托管 symlink 占位,拒绝覆盖")
+            elif dest_dir.exists() and not dest_dir.is_dir():
+                raise WorkspaceError(f"projection {p['to']}: refuses to overwrite existing file")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for n in wanted:
+                _link_one(src_base / n, dest_dir / n, f"{p['to']}/{n}", ours, new_links)
+            info(f"{p['to']}/  =  {len(wanted)} 条目 ({flt})")
+        else:
+            src = src_base.resolve()
+            dest = ROOT / p["to"]
+            _link_one(src, dest, p["to"], ours, new_links)
+            info(f"{p['to']}  ->  {os.path.relpath(src, dest.parent)}")
 
     # 清理:上一轮创建、本轮配置已删除的链接
     for old in ours - set(new_links):
@@ -355,7 +425,30 @@ def project_links(projections: list, state: dict) -> dict:
             path.unlink()
             info(f"removed stale link {old}")
 
+    # 回收 entries 模式遗留的空目录
+    product = ROOT / "product"
+    if product.exists():
+        for dirpath, _, _ in os.walk(product, topdown=False):
+            d = Path(dirpath)
+            if d != product and d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+
     return new_links
+
+
+def write_product_marker():
+    """在 product/ 放置警示牌:这是生成视图,不是执行构建的地方。"""
+    product = ROOT / "product"
+    product.mkdir(exist_ok=True)
+    (product / "README.md").write_text(
+        "本目录由 `workspace sync` 生成(全部是 symlink 投影)。\n\n"
+        "不要在这里创建文件、运行 pnpm/maven/docker 等构建工具——\n"
+        "symlink 视图与这类工具的 realpath 语义冲突,必然出错。\n\n"
+        "执行位置:\n"
+        "  - 依赖的构建/开发 → ../.sources/<name>(真实工作树)\n"
+        "  - 本地自己的代码   → 工作区根目录下的真实目录(如 app/、deploy/)\n"
+        "  - docker 构建      → 以工作区根为 context,COPY 指向 ../.sources/...\n"
+    )
 
 
 # ---------------------------------------------------------------- commands
@@ -398,6 +491,7 @@ def cmd_sync(args):
 
     step("projections")
     new_links = project_links(cfg["projections"], state)
+    write_product_marker()
 
     state["sources"] = {
         name: {

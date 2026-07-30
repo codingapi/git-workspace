@@ -31,10 +31,10 @@ workspace/
 │   ├── flow-engine/        full
 │   ├── flow-frontend/      full         ← pnpm i / build 在这里跑
 │   └── fastjson2/          sparse: core ← tag 2.0.63 钉版本
-├── product/                投影出的逻辑工作区(全部是 symlink)
-│   ├── flow-engine  -> ../.sources/flow-engine
-│   ├── web          -> ../.sources/flow-frontend
-│   ├── docs         -> ../.sources/flow-frontend/docs
+├── product/                投影出的逻辑工作区(纯视图,禁止在此执行构建)
+│   ├── flow-engine/        entries 真实目录(后端各条目逐条链接)
+│   │   └── web/            entries 真实目录(前端各条目,排除 apps)
+│   ├── web2/               entries 真实目录(仅 apps + docs)
 │   └── third-party/fastjson2-core -> ../../.sources/fastjson2/core
 ├── workspace.yaml          声明式配置(入库)
 └── workspace.lock.yaml     解析后的 commit SHA 快照(入库 → 团队精确复现)
@@ -66,13 +66,19 @@ projections:
     from: <源内子路径,或 . 表示整仓>
     to: <工作区内目标路径>
     mode: symlink
+    # 可选过滤器(仅 from: . 可用;触发 entries 模式——dest 为真实目录,条目逐条链接):
+    exclude: [apps]         # 黑名单:链接其余全部;条目集 sync 时动态枚举,上游新增目录自动出现
+    include: [apps, docs]   # 白名单:只链接这些;["*"] = 全部条目(dest 随后可承载子投影)
 ```
 
 ## 使用规则(踩坑换来的边界认知)
 
-1. **要执行命令 → 进 `.sources/<name>`**(真实目录,路径解析无歧义);
-   `product/` 只用于浏览、IDE 导入、后端消费构建产物——不要在里面跑
-   pnpm/maven 等依赖 realpath 语义的工具。
+1. **要执行命令 → 进 `.sources/<name>` 或工作区根目录的本地代码目录**,
+   两者都是真实目录。`product/` 是 symlink 视图:只供浏览、IDE 导入、
+   查看产物。不要在 symlink 视图里跑 pnpm/maven(Node 的 realpath 机制
+   必然出错),也不要把 product/ 当 docker 构建上下文(指向 context 外的
+   symlink 会被丢弃)——docker 构建以工作区根为 context,COPY 指向
+   `.sources/...` 与本地目录。
 2. **构建产物自动穿透投影**:在 `.sources/flow-frontend` 里 build,
    产物 `dist/` 会即时出现在 `product/web/...` 中(symlink 按路径寻址)。
 3. **lock 入库**:提交 `workspace.lock.yaml`,任何人 `git clone` 本仓库 +
@@ -119,6 +125,18 @@ git commit -am "bump fastjson2 2.0.63 → 2.0.64"
 精确复现该版本的源码组合,再 `mvn package` / `pnpm build` 即得制品。
 号码维护:后端用 maven `${revision}`(CI-friendly versions),前端用
 `pnpm -r` 协调 bump,两者与外层 tag 对齐即可。
+
+## 本地代码放哪里
+
+自己写的代码(集成服务、部署配置、测试等)放在**工作区根目录下的真实目录**
+(约定如 `app/`、`deploy/`、`tests/`、`tools/`),由外层 git 仓库跟踪,
+直接编辑、提交、构建——它们是真实目录,没有任何 symlink 问题。
+
+不要放在这三处:`product/`(生成视图,clean 即焚,且被 gitignore)、
+`.sources/`(他人的 git 工作树)、`.workspace/`(工具元数据)。
+
+product/ 是"依赖的装配视图",不是代码的家;本地代码与它在根目录平级共存,
+构建脚本在两者之间编排。
 
 ## 只读与提交防护
 
