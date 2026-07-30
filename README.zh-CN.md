@@ -2,6 +2,8 @@
 
 [English](README.md) | **中文**
 
+[![CI](https://github.com/codingapi/git-workspace/actions/workflows/ci.yml/badge.svg)](https://github.com/codingapi/git-workspace/actions/workflows/ci.yml)
+
 git-workspace 是一个 git 多仓库工作区管理工具。在一份 YAML 里声明所有仓库,
 一条命令即可把它们装配成一棵真实的工程目录树 —— 全部由真实的 git worktree
 构成,没有任何 symlink。用 IDE 打开根目录,照常开发、构建、调试。
@@ -96,7 +98,7 @@ iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/in
 | `git-workspace sync --locked` | 精确检出 lock 中的 SHA;要求配置与 lock 一致;不重写 lock(CI) |
 | `git-workspace status` | 查看各源 SHA、dirty 状态、检出过滤、只读状态 |
 | `git-workspace outdated` | 检查 lock 漂移与上游新 tag |
-| `git-workspace verify` | CI 完整性校验:各源与 lock 一致、只读源干净且已锁定(失败时非零退出) |
+| `git-workspace verify` | CI 门禁:lock 存在且整棵树与之一致、所有源均干净时才通过(只读源还须已锁定) |
 | `git-workspace update` | 自我更新到最新发布版本 |
 | `git-workspace clean [--all]` | 拆除 worktree(`--all` 连同对象缓存一起清除) |
 | `git-workspace version` | 打印版本(也支持 `-V` / `--version`) |
@@ -128,8 +130,9 @@ git-workspace.yaml ──▶ 引擎 ──▶ .workspace/git-cache/      (镜像
   `git-workspace.lock.yaml`。提交入库后,任何人(或 CI)用
   `sync --locked` 精确复现整棵树:该模式直接检出 *lock 中的* SHA
   (忽略 `main` 这类浮动 revision 的上游推进),要求配置的 source 集合、
-  `url`、`revision` 与 lock 一致,且绝不重写 lock。随后 `verify`
-  可断言已物化的树与 lock 一致、只读源干净且已锁定。
+  `url`、`revision` 与 lock 一致,且绝不重写 lock。`verify` 是其 CI 门禁:
+  仅当 lock 存在且格式正确、配置与 lock 一致、每个源都已按 lock SHA 物化
+  且工作树干净时才通过(只读源还须文件系统级锁定)。
 - **工作区根发现** —— CLI 从当前目录逐级向上查找 `git-workspace.yaml`,
   因此无论是全局安装还是从克隆直接运行,行为完全一致。
 - **托管 git 过滤** —— 每次 sync 整体重写各仓库 exclude 文件中的标记块
@@ -147,7 +150,7 @@ git-workspace.yaml ──▶ 引擎 ──▶ .workspace/git-cache/      (镜像
 git clone git@github.com:codingapi/git-workspace.git && cd git-workspace
 ./git-workspace -h
 # 用自带示例做端到端冒烟测试:
-cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace status
+cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace status && ./git-workspace verify
 ./git-workspace clean --all && rm git-workspace.yaml git-workspace.lock.yaml
 ```
 
@@ -155,7 +158,11 @@ cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace st
 
 - 保持单文件设计 —— 整个引擎就是 `git-workspace`,无构建步骤,只用标准库 + PyYAML。
 - 保持声明式 —— 新能力应体现在 `git-workspace.yaml` 里,而不是堆命令行参数。
-- 暂无测试套件 —— 改动后用上面的冒烟测试和 `git-workspace -h` 验证。
+- 提交 PR 前跑回归测试:`python -m unittest discover -s tests -v`(需要 git + PyYAML)。CI 通过 `.github/workflows/ci.yml` 在 Linux、macOS、Windows 上运行。
 - 发版流程:升级 `__version__` → 提交 → `git tag v<version>` → 推送 tag,安装脚本与 `update` 会自动感知。
+
+> 注意:v0.4.0 起,镜像缓存目录名加入了源 URL 的短哈希(因此不同 URL 绝不
+> 会共用缓存)。升级后每个源会重新克隆一次,旧缓存目录会遗留,可用
+> `git-workspace clean --all` 清除。
 
 Issue 与 Pull Request:https://github.com/codingapi/git-workspace

@@ -32,7 +32,7 @@ Commands:
     git-workspace sync --locked   strict mode: reproduce the exact locked SHAs; config must match the lock; lock is not rewritten (CI / team reproduction)
     git-workspace status          show per-source status
     git-workspace outdated        check lock drift and newer upstream versions
-    git-workspace verify          integrity check for CI: sources match the lock, read-only sources clean and locked
+    git-workspace verify          CI gate: fail unless the tree matches the lock and every source is clean (read-only also locked)
     git-workspace guard           commit protection: refuse staging assembly dirs in the outer repo (called by the git hook)
     git-workspace clean           remove worktrees (--all also removes the git cache)
     git-workspace update          self-update to the latest upstream release tag
@@ -40,6 +40,7 @@ Commands:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -49,7 +50,7 @@ from pathlib import Path
 
 import yaml
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 UPSTREAM_URL = "https://github.com/codingapi/git-workspace.git"
 
@@ -181,6 +182,30 @@ def load_lock() -> dict:
     return out
 
 
+def config_lock_mismatches(cfg, lock) -> list:
+    """Disagreements between the config and a lock snapshot, as human-readable
+    strings; an empty list means the two are consistent. Shared by
+    `sync --locked` and `verify` so the two never drift apart. Checks the
+    source set, and per source the url, revision and SHA validity."""
+    problems = []
+    for n in cfg["sources"]:
+        if n not in lock:
+            problems.append(f"{n}: not present in lock")
+    for n in lock:
+        if n not in cfg["sources"]:
+            problems.append(f"{n}: in lock but no longer in config")
+    for n, src in cfg["sources"].items():
+        if n not in lock:
+            continue
+        if not lock[n].get("sha"):
+            problems.append(f"{n}: lock has no valid SHA (corrupt lock file?)")
+        if lock[n].get("url") != src["url"]:
+            problems.append(f"{n}: url {lock[n].get('url')!r} (lock) != {src['url']!r} (config)")
+        if lock[n].get("revision") != src["revision"]:
+            problems.append(f"{n}: revision {lock[n].get('revision')!r} (lock) != {src['revision']!r} (config)")
+    return problems
+
+
 def source_path(src: dict, name: str) -> str:
     return src.get("path") or name
 
@@ -221,12 +246,15 @@ def filter_label(filt: dict) -> str:
 
 
 def cache_key(src: dict) -> str:
-    """Mirror cache key: defaults to the URL (multiple sources from the same repo
-    automatically share one object store); override with the cache: attribute
-    (e.g. to pin the cache name when the URL changes often)."""
+    """Mirror cache key. Multiple sources from the *same* URL share one object
+    store; distinct URLs must never share a cache, so the key is a readable
+    slug plus a short hash of the exact URL (a plain slug is lossy and can
+    collide, e.g. .../a/b.git vs .../a-b.git). Override with the cache:
+    attribute (e.g. to pin the cache name when the URL changes often)."""
     if src.get("cache"):
         return src["cache"]
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", src["url"]).strip("-")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", src["url"]).strip("-") or "repo"
+    return f"{slug}-{hashlib.sha256(src['url'].encode()).hexdigest()[:16]}"
 
 
 def all_source_paths(cfg) -> list:
@@ -358,6 +386,18 @@ def load_config() -> dict:
             die(f"source {name}: path {path!r} escapes the workspace root (symlinked ancestor?)")
         paths_seen[path] = name
 
+    # cache-key rule: one cache must map to exactly one URL (a shared `cache:`
+    # override pointing at two different URLs would silently cross-wire them)
+    cache_owner = {}
+    for name, src in sources.items():
+        key = cache_key(src)
+        if key in cache_owner and cache_owner[key][1] != src["url"]:
+            die(
+                f"source {name}: cache key {key!r} is already used by source"
+                f" {cache_owner[key][0]!r} with a different URL — each cache must"
+                " map to exactly one URL (remove the shared `cache:` override)")
+        cache_owner[key] = (name, src["url"])
+
     # nesting rule: no source may be assembled inside a read-only source
     for name, src in sources.items():
         if not src.get("readonly"):
@@ -374,6 +414,20 @@ def load_config() -> dict:
 
 # ---------------------------------------------------------------- git plumbing
 
+def _assert_cache_url(cache: Path, url: str, key: str):
+    """Defense in depth: a cache reused at this key must actually track `url`.
+    With the hashed default key this always holds; this mainly guards explicit
+    `cache:` overrides from silently cross-wiring two repositories."""
+    try:
+        cur = git(["remote", "get-url", "origin"], cwd=cache)
+    except WorkspaceError:
+        return  # no origin to check (unusual cache) — allow rather than crash
+    if cur and cur != url:
+        raise WorkspaceError(
+            f"cache {key}.git tracks {cur!r}, not {url!r} — refusing to reuse it;"
+            " remove .workspace/git-cache (or set a distinct `cache:` key) and re-sync")
+
+
 def ensure_cache(src: dict, fetched: set):
     """clone --mirror or incrementally update the object cache; one fetch per cache key per sync."""
     key = cache_key(src)
@@ -381,6 +435,7 @@ def ensure_cache(src: dict, fetched: set):
     if key in fetched:
         return cache
     if cache.exists():
+        _assert_cache_url(cache, src["url"], key)
         git(["fetch", "--prune", "--quiet", "origin"], cwd=cache)
         info(f"mirror updated ({key})")
     else:
@@ -670,24 +725,11 @@ def cmd_sync(args):
         if not lock:
             raise WorkspaceError(
                 "--locked requires git-workspace.lock.yaml — run `git-workspace sync` first to create it")
-        missing = [n for n in cfg["sources"] if n not in lock]
-        extra = [n for n in lock if n not in cfg["sources"]]
-        mismatches = []
-        for n, src in cfg["sources"].items():
-            if n not in lock:
-                continue
-            if not lock[n].get("sha"):
-                mismatches.append(f"  {n}: lock has no valid SHA (corrupt lock file?)")
-            if lock[n].get("url") != src["url"]:
-                mismatches.append(f"  {n}: url {lock[n].get('url')!r} (lock) != {src['url']!r} (config)")
-            if lock[n].get("revision") != src["revision"]:
-                mismatches.append(f"  {n}: revision {lock[n].get('revision')!r} (lock) != {src['revision']!r} (config)")
-        if missing or extra or mismatches:
-            lines = [f"  {n}: not present in lock" for n in missing]
-            lines += [f"  {n}: in lock but no longer in config" for n in extra]
-            lines += mismatches
+        problems = config_lock_mismatches(cfg, lock)
+        if problems:
             raise WorkspaceError(
-                "--locked refused: config and lock disagree:\n" + "\n".join(lines)
+                "--locked refused: config and lock disagree:\n"
+                + "\n".join(f"  {p}" for p in problems)
                 + "\nIf this is intentional: run `git-workspace sync` (without --locked) to"
                 " re-lock, verify, then commit git-workspace.yaml and the lock together")
 
@@ -814,12 +856,30 @@ def cmd_outdated(_args):
 
 
 def cmd_verify(_args):
-    """Integrity check for CI: every source materialized, HEAD matching the
-    lock, and every read-only source clean and filesystem-locked. Exits
-    non-zero on any problem so it can gate a pipeline."""
+    """Integrity gate for CI: fails unless the workspace faithfully reproduces
+    the committed lock — the lock exists and is well-formed, config and lock
+    agree (source set, url, revision), every source is materialized with HEAD
+    equal to its locked SHA and a clean worktree, and read-only sources are
+    also filesystem-locked. Exits non-zero on any problem. For an informal
+    health check that tolerates dev work-in-progress, use `status`."""
     cfg = load_config()
-    lock = load_lock()
     problems = []
+
+    if not LOCK_PATH.exists():
+        problems.append("lock file missing — run `git-workspace sync` to create it")
+        lock = {}
+    else:
+        try:
+            raw = yaml.safe_load(LOCK_PATH.read_text()) or {}
+        except yaml.YAMLError:
+            raw = None
+        if not isinstance(raw, dict) or raw.get("version") != 1:
+            problems.append("lock file is corrupt or has an unsupported version (expected version: 1)")
+        lock = load_lock()
+
+    # config <-> lock consistency (source set, url, revision, sha validity)
+    problems += config_lock_mismatches(cfg, lock)
+
     for name, src in cfg["sources"].items():
         path = source_path(src, name)
         wt = ROOT / path
@@ -831,17 +891,19 @@ def cmd_verify(_args):
         locked_sha = lock.get(name, {}).get("sha", "")
         if locked_sha and head != locked_sha:
             problems.append(f"{name}: HEAD {(head or '?')[:12]} != lock {locked_sha[:12]}")
-        if readonly:
-            if git(["status", "--porcelain"], cwd=wt):
-                problems.append(f"{name}: read-only source is DIRTY")
-            if not is_locked(wt):
-                problems.append(f"{name}: read-only source is NOT LOCKED")
+        # verify is a reproduction gate: the tree must match the lock exactly,
+        # so any uncommitted change (writable source included) is a failure
+        if git(["status", "--porcelain"], cwd=wt):
+            problems.append(f"{name}: worktree is DIRTY")
+        if readonly and not is_locked(wt):
+            problems.append(f"{name}: read-only source is NOT LOCKED")
+
     if problems:
         print("verify failed:", file=sys.stderr)
         for p in problems:
             print(f"  ✗ {p}", file=sys.stderr)
         sys.exit(1)
-    step("verify ok: all sources match the lock; read-only sources are clean and locked")
+    step("verify ok: all sources match the lock and are clean; read-only sources are locked")
 
 
 def cmd_guard(_args):
@@ -933,7 +995,7 @@ EPILOG = """examples:
   git-workspace sync --locked       strict mode: reproduce the exact locked SHAs; config must match the lock; lock not rewritten (CI)
   git-workspace status              show per-source SHA, dirty, filter and read-only state
   git-workspace outdated            check lock drift and newer upstream tags
-  git-workspace verify              integrity check for CI: sources match the lock, read-only sources clean and locked
+  git-workspace verify              CI gate: fail unless the tree matches the lock and every source is clean (read-only also locked)
   git-workspace clean [--all]       remove worktrees (--all also removes the git cache)
   git-workspace update              self-update to the latest upstream release tag
 """
@@ -959,7 +1021,7 @@ def main():
     )
     sub.add_parser("status", help="show per-source status")
     sub.add_parser("outdated", help="check lock drift and newer upstream versions")
-    sub.add_parser("verify", help="integrity check: sources match the lock, read-only sources clean and locked (CI gate)")
+    sub.add_parser("verify", help="CI gate: fail unless the tree matches the lock and every source is clean (read-only sources also locked)")
     sub.add_parser("guard", help="commit-protection check (called by the git pre-commit hook)")
     p_clean = sub.add_parser("clean", help="remove worktrees")
     p_clean.add_argument("--all", action="store_true", help="also remove .workspace/git-cache")

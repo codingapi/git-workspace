@@ -2,6 +2,8 @@
 
 **English** | [中文](README.zh-CN.md)
 
+[![CI](https://github.com/codingapi/git-workspace/actions/workflows/ci.yml/badge.svg)](https://github.com/codingapi/git-workspace/actions/workflows/ci.yml)
+
 git-workspace is a multi-repository workspace manager for git. You declare all
 your repositories in one YAML file, and one command assembles them into a real
 project tree — built from real git worktrees, no symlinks. Open the root in
@@ -98,7 +100,7 @@ To also remove a workspace's worktrees and caches first: `git-workspace clean --
 | `git-workspace sync --locked` | Reproduce the exact locked SHAs; config must match the lock; lock is not rewritten (CI) |
 | `git-workspace status` | Per-source SHA, dirty state, checkout filters, read-only state |
 | `git-workspace outdated` | Check lock drift and newer upstream tags |
-| `git-workspace verify` | Integrity check for CI: sources match the lock, read-only sources clean and locked (non-zero exit on failure) |
+| `git-workspace verify` | CI gate: fail unless the lock exists and the tree matches it with every source clean (read-only sources also locked) |
 | `git-workspace update` | Self-update to the latest release |
 | `git-workspace clean [--all]` | Remove worktrees (`--all` also clears the object caches) |
 | `git-workspace version` | Print the version (also `-V` / `--version`) |
@@ -136,8 +138,10 @@ git-workspace.yaml ──▶ engine ──▶ .workspace/git-cache/      (mirror
   exact tree with `sync --locked`: in that mode the engine checks out the
   *locked* SHA verbatim (a floating revision like `main` advancing upstream is
   ignored), requires the config's source set, `url` and `revision` to match the
-  lock, and never rewrites it. `verify` then asserts the materialized tree
-  matches the lock and that read-only sources are clean and locked.
+  lock, and never rewrites it. `verify` is the CI gate for this: it fails
+  unless the lock exists and is well-formed, config and lock agree, and every
+  source is materialized at its locked SHA with a clean worktree (read-only
+  sources must also be filesystem-locked).
 - **Workspace root discovery** — the CLI walks up from the current directory
   to find `git-workspace.yaml`, so it behaves identically whether installed
   globally or run from a clone.
@@ -160,7 +164,7 @@ from the clone:
 git clone git@github.com:codingapi/git-workspace.git && cd git-workspace
 ./git-workspace -h
 # end-to-end smoke test against the bundled example:
-cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace status
+cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace status && ./git-workspace verify
 ./git-workspace clean --all && rm git-workspace.yaml git-workspace.lock.yaml
 ```
 
@@ -168,7 +172,12 @@ Guidelines:
 
 - Keep the single-file design — the entire engine is `git-workspace`; no build step, stdlib + PyYAML only.
 - Keep it declarative — new capabilities belong in `git-workspace.yaml`, not in flags.
-- There is no test suite yet — verify changes with the smoke test above and `git-workspace -h`.
+- Run the regression suite before sending a PR: `python -m unittest discover -s tests -v` (needs git + PyYAML). CI runs it on Linux, macOS and Windows via `.github/workflows/ci.yml`.
 - Releases: bump `__version__` → commit → `git tag v<version>` → push the tag; installers and `update` pick it up automatically.
+
+> Note: since v0.4.0 the mirror-cache directory name includes a short hash of
+> the source URL (so distinct URLs can never share a cache). Upgrading re-clones
+> each source once; the old cache directories are left behind and can be removed
+> with `git-workspace clean --all`.
 
 Issues and pull requests: https://github.com/codingapi/git-workspace
