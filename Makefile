@@ -1,27 +1,34 @@
-# 工作区投影层的一键入口(实际能力由 ./workspace 提供)
+# One-stop entry points for the Workspace Projection Layer (real work done by ./git-workspace).
+# Workspace targets operate on a local git-workspace.yaml — copy example.yaml to get started.
 
-.PHONY: setup sync locked outdated status clean clean-all build-web
+.PHONY: setup sync locked outdated status clean clean-all build-web install uninstall
 
-setup: ## 首次初始化:拉取全部源 + 物化 worktree + 建立投影
-	./workspace sync
+setup: ## First-time init: fetch all sources + materialize worktrees
+	./git-workspace sync
 
-sync: ## 同步:更新缓存、重解析 revision、校正 worktree 与投影
-	./workspace sync
+sync: ## Sync: update caches, re-resolve revisions, fix up worktrees and filters
+	./git-workspace sync
 
-locked: ## 严格同步:与 lock 不一致即失败(CI/团队成员用)
-	./workspace sync --locked
+locked: ## Strict sync: fail on any mismatch with the lock (CI / team members)
+	./git-workspace sync --locked
 
-outdated: ## 检查各源相对 lock 的漂移与上游新版本
-	./workspace outdated
+outdated: ## Check each source for lock drift and newer upstream versions
+	./git-workspace outdated
 
-status: ## 查看源与投影状态
-	./workspace status
+status: ## Show source and projection status
+	./git-workspace status
 
-clean: ## 删除 worktree 与投影(保留 git 缓存)
-	./workspace clean
+clean: ## Remove worktrees (keeps the git cache)
+	./git-workspace clean
 
-clean-all: ## 连 git 缓存一并删除(下次 sync 重新克隆)
-	./workspace clean --all
+clean-all: ## Remove worktrees and the git cache (next sync re-clones)
+	./git-workspace clean --all
 
-build-web: ## 在前端装配位置安装依赖并构建核心包
+build-web: ## Example consumer command: install deps and build the core package at the frontend location
 	cd flow-engine/web && pnpm i && pnpm build:flow-core
+
+install: ## Install the git-workspace CLI (default prefix ~/.local; override with PREFIX=...)
+	./install.sh
+
+uninstall: ## Remove the installed git-workspace CLI
+	./install.sh --uninstall

@@ -1,132 +1,192 @@
-# Workspace Projection Layer(工作区投影层)
+# git-workspace — Workspace Projection Layer
 
-在 Git 与构建系统之间的一层:一份声明式 `workspace.yaml`,自动装配出
-**真实的工程树**。
+A layer between Git and your build system: one declarative `git-workspace.yaml`
+automatically assembles a **real project tree**.
 
-## 核心模型:仓库分两种角色
+## Core model: repositories come in two roles
 
-- **开发型仓库**(flow-engine、flow-frontend)——工程的组成部分。真实 git
-  worktree 直接装配在工程的逻辑位置上。**IDE 打开工作区根目录,开发、构建、
-  调试都在真实目录里发生**,pnpm/maven/docker 无 symlink 问题;
-- **消费型依赖**(fastjson2)——只读输入。真实 worktree + 检出过滤
-  (include/exclude)+ 文件系统级只读锁,唯一写入者是同步工具。
+- **Development repos** (flow-engine, flow-frontend) — parts of your product.
+  Real git worktrees assembled directly at their logical project locations.
+  **Open the workspace root in your IDE; develop, build and debug all happen
+  in real directories** — no symlink problems for pnpm/maven/docker;
+- **Consumed dependencies** (fastjson2) — read-only inputs. Real worktrees +
+  checkout filters (include/exclude) + a filesystem-level read-only lock; the
+  only writer is the sync tool.
 
-工作区内**没有任何 symlink**——装配树全是真实目录,IDE、pnpm、maven、
-docker 均以真实路径工作,不存在逻辑路径与 realpath 的分裂。
+There are **no symlinks anywhere** in the workspace — the assembled tree is
+all real directories. IDE, pnpm, maven and docker all work on real paths,
+with no split between logical paths and realpath.
 
 ```
-workspace.yaml ──▶ 投影引擎 ──▶ 真实 worktree(装配位置)
-                     │
-        fetch / lock / filter / worktree / guard / git 过滤
+git-workspace.yaml ──▶ projection engine ──▶ real worktrees (assembly locations)
+                            │
+             fetch / lock / filter / worktree / guard / git filters
 ```
 
-## 目录结构
+## Directory layout
 
 ```
 workspace/
-├── flow-engine/            ← 真实 worktree:后端(mvn 在这里执行)
-│   └── web/                ← 真实 worktree:前端,嵌套装配(pnpm 在这里执行)
-├── frameworks/fastjson2-*  ← 真实 worktree:include 过滤 + 只读锁定(同仓两处)
-├── app/ deploy/ tests/     ← 本地自己的代码(示例名;外层 git 自动跟踪)
-├── .workspace/git-cache/   ← bare/mirror 对象缓存(worktree 共享 objects)
-├── workspace.yaml          ← 声明式配置(入库)
-└── workspace.lock.yaml     ← commit SHA 锁定快照(入库 → 团队精确复现)
+├── flow-engine/            ← real worktree: backend (run mvn here)
+│   └── web/                ← real worktree: frontend, nested assembly (run pnpm here)
+├── frameworks/fastjson2-*  ← real worktrees: include filter + read-only lock (same repo, two places)
+├── app/ deploy/ tests/     ← your own local code (example names; tracked by the outer git automatically)
+├── .workspace/git-cache/   ← bare/mirror object caches (worktrees share objects)
+├── git-workspace.yaml      ← declarative config (checked in)
+└── git-workspace.lock.yaml ← commit SHA lock snapshot (checked in → exact team reproduction)
 ```
 
-## 命令
+## Install
+
+Requires: Python 3.8+, git, PyYAML (the installers check / install PyYAML for you).
+
+**Linux / macOS / Windows Git-Bash:**
 
 ```bash
-./workspace sync            # 或 make setup / make sync
-./workspace sync --locked   # 严格模式:与 lock 不一致即失败(CI/团队复现)
-./workspace status          # 源 SHA、dirty、检出过滤、只读状态
-./workspace outdated        # 上游有无新 tag、lock 是否漂移
-./workspace guard           # 提交防护检查(由 pre-commit 钩子调用)
-./workspace clean           # 拆除 worktree(--all 连同 git 缓存)
+git clone git@github.com:codingapi/git-workspace.git
+cd git-workspace
+./install.sh                  # installs to ~/.local/bin (override with --prefix DIR)
+./install.sh --uninstall      # remove it
 ```
 
-## workspace.yaml 语法
+**Windows (native, PowerShell):**
+
+```powershell
+git clone git@github.com:codingapi/git-workspace.git
+cd git-workspace
+powershell -ExecutionPolicy Bypass -File install.ps1        # adds git-workspace to your user PATH
+powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
+```
+
+On Windows the read-only lock maps to the read-only file attribute (still
+effective — Python's `os.access(W_OK)` honors it).
+
+## Commands
+
+```bash
+git-workspace init            # scaffold a starter git-workspace.yaml + commit-protection hooks
+git-workspace sync            # or: make setup / make sync
+git-workspace sync --locked   # strict mode: fail on any mismatch with the lock (CI / team reproduction)
+git-workspace status          # source SHAs, dirty state, checkout filters, read-only state
+git-workspace outdated        # newer upstream tags? lock drift?
+git-workspace guard           # commit-protection check (called by the pre-commit hook)
+git-workspace clean           # tear down worktrees (--all also removes the git cache)
+git-workspace version         # print version
+```
+
+## Trying the example
+
+This repo ships `example.yaml` (plus `example.lock.yaml`, a sample of the
+generated lock). To see the engine assemble a real multi-repo tree:
+
+```bash
+cp example.yaml git-workspace.yaml
+git-workspace sync
+git-workspace status
+git-workspace clean --all     # tear it all down again
+```
+
+## git-workspace.yaml syntax
 
 ```yaml
 version: 1
 
 sources:
-  <名字>:
-    url: <git 地址>
-    revision: <分支 | tag | SHA>        # sync 时解析为 SHA 写入 lock
-    path: <工程内装配位置>               # 可嵌套(如 flow-engine/web);缺省 = 源名字
-    include: [<目录>...]                 # 可选白名单:只检出这些目录(cone 模式,git 推荐;顶层文件恒保留)
-    exclude: [<路径>...]                 # 可选黑名单:检出其余全部(non-cone 模式,支持嵌套路径如 a/b/c)
-    # include 与 exclude 互斥;都不写 = 全量检出
-    readonly: true                       # 可选,文件系统级只读(三方依赖推荐)
-    cache: <缓存名>                      # 可选,显式镜像缓存键;缺省按 URL 键控,同 url 自动共享
+  <name>:
+    url: <git url>
+    revision: <branch | tag | SHA>     # resolved to a SHA in the lock on sync
+    path: <assembly location>          # may nest (e.g. flow-engine/web); default = source name
+    include: [<dir>...]                # optional whitelist: check out only these dirs (cone mode, git-recommended; top-level files always kept)
+    exclude: [<path>...]               # optional blacklist: check out everything else (non-cone mode, supports nested paths like a/b/c)
+    # include and exclude are mutually exclusive; neither = full checkout
+    readonly: true                     # optional, filesystem-level read-only (recommended for third-party deps)
+    cache: <cache name>                # optional explicit mirror cache key; defaults to keying by URL, same url shares automatically
 ```
 
-**同一仓库多处装配**:相同 url 配置多条 source = 多个独立 worktree
-(各自独立的过滤/只读/HEAD),对象自动共享同一个镜像缓存,不重复
-下载——这是 git worktree 的原生语义。同一仓库的不同 revision 也可
-这样并存。每条配置的 `path` 即装配位置,`include`/`exclude` 即检出
-过滤,组合 = "取指定内容,放到指定位置"。
+**Same repo assembled in multiple places**: several source entries with the
+same url = multiple independent worktrees (each with its own
+filter/read-only/HEAD); objects automatically share one mirror cache — no
+duplicate downloads. This is native git worktree semantics. Different
+revisions of the same repo can coexist this way too. Each entry's `path` is
+the assembly location and `include`/`exclude` the checkout filter; the
+combination = "take this content, put it there".
 
-**过滤的两个边界**:
-- `include`(cone)是目录粒度;`exclude`(non-cone)支持嵌套路径,底层
-  是 gitignore 式取反模式,性能略低于 cone,git 官方亦提示其行为可能
-  演进——优先用 include,exclude 用于"除了少数目录之外的全部"场景;
-- 剪枝**不会删除含未跟踪文件的目录**(如已安装的 node_modules)——这是
-  git 的数据保护,受跟踪内容照常剪除;merge/rebase 后若重新出现非过滤
-  路径,`./workspace sync` 会自动重新应用。
+**Two boundaries of filtering**:
+- `include` (cone) is directory-granular; `exclude` (non-cone) supports
+  nested paths and is backed by gitignore-style negation patterns — slightly
+  slower than cone, and git officially notes its behavior may evolve. Prefer
+  include; use exclude for "everything except a few dirs" cases;
+- pruning **never deletes directories containing untracked files** (e.g. an
+  installed node_modules) — that's git's data protection; tracked content is
+  pruned as usual. If non-filtered paths reappear after a merge/rebase,
+  `git-workspace sync` re-applies the filters automatically.
 
-## 使用规则
+## Usage rules
 
-1. **工程开发直接在装配树里进行**——全部是真实目录:IDE 打开根目录,
-   `mvn` → `flow-engine/`,`pnpm` → `flow-engine/web/`;docker 构建以
-   工作区根为 context,COPY 指向 `flow-engine/...` 等真实路径。
-2. **git 过滤全自动,不用配任何 ignore**:引擎按 yaml 的装配路径,在
-   外层仓库与父级 worktree 的 exclude 中写入"托管块"(带标记、每次
-   sync 整体重写、自我修复)。**不属于任何装配路径的目录即本地代码,
-   自动被外层 git 跟踪**——新建 `app/` 随手就能 commit;装配路径即使
-   嵌在本地目录深处(如 `app/vendor/lib`)也只精确忽略该路径。
-   嵌套装配(如 `flow-engine/web`)由父仓库的托管块忽略,不污染父仓库
-   的 status。
-3. **本地代码放工作区根的普通目录**(如 `app/`、`deploy/`、`tests/`),
-   正常编辑、提交、构建。不要放进装配目录——那是他人的 git 工作树。
-4. **lock 入库**:提交 `workspace.lock.yaml`,团队 `git clone` +
-   `./workspace sync --locked` 精确复现。升级 = 改 revision → sync →
-   验证 → 配置与 lock 一并提交(显式事件,不漂移)。
-5. **嵌套装配**:`path` 可位于另一源内部(如 `flow-engine/web`),引擎
-   自动处理父仓库忽略;只读源内部禁止再嵌套装配。
+1. **Develop directly in the assembled tree** — it's all real directories:
+   open the root in your IDE, `mvn` → `flow-engine/`, `pnpm` →
+   `flow-engine/web/`; docker builds use the workspace root as context and
+   COPY points at real paths like `flow-engine/...`.
+2. **Git filtering is fully automatic — configure no ignores yourself**: from
+   the assembly paths in the yaml, the engine writes "managed blocks" (marked,
+   rewritten wholesale on every sync, self-healing) into the outer repo's and
+   parent worktrees' exclude files. **Any directory that is not an assembly
+   path is local code, tracked by the outer git automatically** — create
+   `app/` and commit it right away; an assembly path nested deep inside local
+   dirs (e.g. `app/vendor/lib`) is still ignored precisely. Nested assembly
+   (e.g. `flow-engine/web`) is ignored via the parent repo's managed block,
+   without polluting the parent's status.
+3. **Put local code in plain directories at the workspace root** (e.g.
+   `app/`, `deploy/`, `tests/`) — edit, commit and build normally. Don't put
+   it inside assembly directories — those are other repos' git worktrees.
+4. **Check the lock in**: commit `git-workspace.lock.yaml`; teammates
+   `git clone` + `git-workspace sync --locked` reproduce exactly. Upgrade =
+   change revision → sync → verify → commit config and lock together (an
+   explicit event, no drift).
+5. **Nested assembly**: `path` may sit inside another source (e.g.
+   `flow-engine/web`); the engine handles parent-repo ignores automatically.
+   Nesting inside a read-only source is forbidden.
 
-## 只读与提交防护
+## Read-only and commit protection
 
-- **只读锁定**:`readonly: true` 的源同步后被 chmod 锁定,编辑/新建/
-  删除全部 `Permission denied`,连 `rm -rf` 都删不掉——拆除走
-  `workspace clean`(自动解锁)。唯一写入者是 `workspace sync` 自身
-  (同步时解锁、结束重新上锁,Nix store 思路)。三方改动请走上游 PR。
-- **同步安全闸**:源有未提交改动或相对上次同步点有本地提交时,sync
-  拒绝覆盖并提示处理位置。
-- **提交防护**:`.githooks/pre-commit` → `workspace guard`,按
-  workspace.yaml 动态计算受保护路径(全部装配路径,精确匹配),拦截
-  `git add -f` 强加与嵌入式 git 仓库(gitlink)。`workspace sync`
-  自动设置 `core.hooksPath`,每份克隆自动生效。
-- **外层仓库收录范围**:配置、lock、文档、工具、本地代码目录——
-  工作区的"定义、说明与自研部分",不含任何三方源码。
+- **Read-only locking**: sources with `readonly: true` are chmod-locked after
+  sync — edits/creates/deletes all fail with `Permission denied`; even
+  `rm -rf` can't delete them. Teardown goes through `git-workspace clean`
+  (auto-unlocks). The only writer is `git-workspace sync` itself (unlock on
+  sync, relock when done — the Nix store idea). Send third-party changes
+  upstream via PR.
+- **Sync safety gate**: if a source has uncommitted changes or local commits
+  since its last sync point, sync refuses to overwrite and tells you where to
+  sort it out.
+- **Commit protection**: `.githooks/pre-commit` → `git-workspace guard`,
+  computing protected paths dynamically from git-workspace.yaml (all assembly
+  paths, exact match); blocks `git add -f` force-adds and embedded git repos
+  (gitlinks). `git-workspace sync` sets `core.hooksPath` automatically, so
+  every clone is protected out of the box.
+- **Outer repo scope**: config, lock, docs, tooling, local code directories —
+  the workspace's "definition, documentation and in-house parts", never any
+  third-party source.
 
-## 版本管理:三层模型
+## Version management: a three-layer model
 
-| 层 | 管什么 | 谁来管 | 升级方式 |
+| Layer | What it manages | Managed by | How to upgrade |
 |---|---|---|---|
-| **源版本** | 每个依赖仓库取哪个快照 | `workspace.yaml` 的 revision(可读 tag)+ `workspace.lock.yaml`(精确 SHA) | 显式 bump commit |
-| **产品版本** | 聚合体整体的版本号 | 外层仓库自己的 git tag | 发版 = 打 tag(tag 时刻的 lock = 完整 BOM) |
-| **生态内部版本** | 各源内部 pom/package.json 的版本号 | 各自生态工具 | 随源快照 bump 自动跟随,不用手动碰 |
+| **Source versions** | which snapshot of each dependency repo | `revision` (readable tag) in git-workspace.yaml + exact SHAs in `git-workspace.lock.yaml` | explicit bump commit |
+| **Product version** | the aggregate's overall version number | the outer repo's own git tags | release = tag (the lock at tag time = the full BOM) |
+| **Ecosystem-internal versions** | version numbers inside each source's pom/package.json | each ecosystem's tools | follows the source snapshot bump automatically — never touch by hand |
 
-发版语义:外层 tag v1.0.0 时刻的 lock 钉死全部源 SHA →
-`git checkout v1.0.0 && ./workspace sync --locked` 精确复现源码组合,
-再 `mvn package` / `pnpm build` 即得制品。号码维护:后端用 maven
-`${revision}`(CI-friendly versions),前端用 `pnpm -r` 协调 bump。
+Release semantics: the lock at outer tag v1.0.0 pins every source SHA →
+`git checkout v1.0.0 && git-workspace sync --locked` reproduces the exact
+source combination, then `mvn package` / `pnpm build` yields the artifacts.
+Number maintenance: backend uses maven `${revision}` (CI-friendly versions),
+frontend uses `pnpm -r` coordinated bumps.
 
-## 与 git 的关系
+## Relationship with git
 
-git 原生是单仓库工具,多仓聚合不在其职责内。本方案中所有"重活"
-(mirror、worktree、sparse-checkout、rev-parse)均为 git 原生能力,
-引擎(~700 行 Python)只做三件事:解析声明、循环调度、执行策略。
-引擎只依赖 git 的稳定 CLI 表面;真正的资产是声明式的 yaml 与 lock——
-它们平台无关,换任何语言/工具都可据此复现工程。
+Git is natively a single-repo tool; multi-repo aggregation is outside its
+scope. In this scheme all the "heavy lifting" (mirror, worktree,
+sparse-checkout, rev-parse) is native git capability — the engine (~800 lines
+of Python) does just three things: parse declarations, schedule the loop,
+execute policy. The engine depends only on git's stable CLI surface; the real
+assets are the declarative yaml and the lock — platform-independent,
+reproducible by any language or tool.

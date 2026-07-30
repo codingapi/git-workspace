@@ -1,34 +1,40 @@
 #!/usr/bin/env python3
-"""Workspace Projection Engine
-==============================
+"""git-workspace — Workspace Projection Engine
+==============================================
 
-在 Git 与构建系统之间的一层:声明式 workspace.yaml → 装配好的真实工程树。
+A layer between Git and your build system: a declarative git-workspace.yaml is
+assembled into a real, ready-to-build project tree.
 
-核心模型——仓库分两种角色,引擎区别对待:
+Core model — repositories come in two roles, handled differently:
 
-  1. 开发型仓库(工程的组成部分):真实 git worktree 直接装配在工程的逻辑
-     位置上(如 flow-engine/、flow-engine/web/),IDE 打开工程根目录即可
-     开发、构建、调试——真实目录,工作区内没有任何 symlink。
-  2. 消费型依赖(只读输入):同样是真实 worktree,但配 sparse + readonly,
-     文件系统级锁定,唯一写入者是本工具。
+  1. Development repos (parts of your product): real git worktrees assembled
+     directly at their logical project locations (e.g. flow-engine/,
+     flow-engine/web/). Open the project root in your IDE and develop, build
+     and debug in real directories — there are no symlinks in the workspace.
+  2. Consumed dependencies (read-only inputs): also real worktrees, but with
+     checkout filters (include/exclude) plus a filesystem-level read-only
+     lock; this tool is their only writer.
 
-Git 过滤全自动:引擎按 yaml 声明的装配路径,在外层仓库与父级 worktree 的
-exclude 中写入"托管块"(managed block),每次 sync 重写、自我修复。不属于
-任何源装配路径的目录即本地代码,自动被外层 git 跟踪——无需任何手工
-gitignore 配置。
+Git filtering is fully automatic: from the assembly paths declared in the
+yaml, the engine writes "managed blocks" into the outer repo's and parent
+worktrees' exclude files — rewritten on every sync, self-healing. Any
+directory that is not an assembly path is local code, tracked by the outer
+git repo automatically — no manual gitignore configuration needed.
 
-布局:
-    .workspace/git-cache/   bare/mirror 对象缓存(多 worktree 共享 objects)
-    <各 source.path>        真实 Git worktree(装配位置,可嵌套)
-    workspace.lock.yaml     解析后的 commit SHA 锁定快照
+Layout:
+    .workspace/git-cache/        bare/mirror object caches (worktrees share objects)
+    <each source.path>           real git worktree (assembly location, may nest)
+    git-workspace.lock.yaml      resolved commit SHA lock snapshot
 
-命令:
-    workspace sync           拉取/更新全部源,物化 worktree,刷新 git 过滤,写 lock
-    workspace sync --locked  严格模式:与 lock 不一致即失败(CI/团队复现)
-    workspace status         查看各源状态
-    workspace outdated       检查 lock 漂移与上游新版本
-    workspace guard          提交防护:拒绝外层仓库暂存装配目录(git hook 调用)
-    workspace clean          拆除 worktree(--all 连同 git 缓存)
+Commands:
+    git-workspace init            create a starter git-workspace.yaml and commit-protection hooks
+    git-workspace sync            fetch/update all sources, materialize worktrees, refresh git filters, write the lock
+    git-workspace sync --locked   strict mode: fail on any mismatch with the lock (CI / team reproduction)
+    git-workspace status          show per-source status
+    git-workspace outdated        check lock drift and newer upstream versions
+    git-workspace guard           commit protection: refuse staging assembly dirs in the outer repo (called by the git hook)
+    git-workspace clean           remove worktrees (--all also removes the git cache)
+    git-workspace version         print version and exit
 """
 
 import argparse
@@ -41,21 +47,60 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "workspace.yaml"
-LOCK_PATH = ROOT / "workspace.lock.yaml"
-DOT = ROOT / ".workspace"
-CACHE = DOT / "git-cache"
-STATE_PATH = DOT / "state.json"
+__version__ = "0.1.0"
 
-BLOCK_BEGIN = "# workspace-engine managed (begin)"
-BLOCK_END = "# workspace-engine managed (end)"
+CONFIG_NAME = "git-workspace.yaml"
+LOCK_NAME = "git-workspace.lock.yaml"
+
+# Populated by init_paths() once the workspace root is resolved.
+ROOT = None
+CONFIG_PATH = None
+LOCK_PATH = None
+DOT = None
+CACHE = None
+STATE_PATH = None
+
+BLOCK_BEGIN = "# git-workspace managed (begin)"
+BLOCK_END = "# git-workspace managed (end)"
 RESERVED_TOPS = {".git", ".workspace"}
 RESERVED_FILES = {
-    "workspace", "workspace.yaml", "workspace.lock.yaml",
+    "git-workspace", "git-workspace.yaml", "git-workspace.lock.yaml",
     "Makefile", "README.md", ".gitignore", ".githooks",
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+HOOK_SCRIPT = """#!/bin/sh
+# Commit protection: policy is computed dynamically by the engine from
+# git-workspace.yaml (protected paths = all assembly dirs + .workspace).
+if command -v git-workspace >/dev/null 2>&1; then
+    exec git-workspace guard
+fi
+exec ./git-workspace guard
+"""
+
+CONFIG_TEMPLATE = """\
+# git-workspace declarative configuration
+# Run `git-workspace sync` after editing to apply changes.
+# Full syntax reference: README.md / example.yaml shipped with git-workspace.
+
+version: 1
+
+sources:
+  # ── Development repo: full checkout assembled at a project location ────
+  # my-backend:
+  #   url: git@github.com:example/my-backend.git
+  #   revision: main                    # branch | tag | SHA (resolved to a SHA in the lock)
+  #   path: my-backend                  # assembly location; may nest (e.g. my-backend/web)
+
+  # ── Third-party dependency: filtered checkout + filesystem read-only ───
+  # my-lib:
+  #   url: git@github.com:example/my-lib.git
+  #   revision: v1.0.0                  # pin a tag for a stable snapshot
+  #   path: libs/my-lib
+  #   include: [core]                   # whitelist: only these dirs (git cone mode; top-level files always kept)
+  #   # exclude: [docs]                 # blacklist alternative (mutually exclusive with include; supports nested paths)
+  #   readonly: true                    # filesystem read-only; only `git-workspace sync` can write
+"""
 
 
 class WorkspaceError(Exception):
@@ -78,7 +123,7 @@ def die(msg: str):
 
 
 def git(args, cwd=None):
-    """运行 git,返回 stdout。失败抛出 WorkspaceError(携带 stderr)。"""
+    """Run git and return stdout. Raises WorkspaceError (with stderr) on failure."""
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd) if cwd else None,
@@ -106,13 +151,13 @@ def save_state(state: dict):
 
 
 class _Quoted(str):
-    """YAML 序列化时强制加引号——sha 可能全为数字,裸标量会被读成整数。"""
+    """Force quotes on YAML serialization — an all-digit SHA would be read back as an integer."""
 
 
 yaml.add_representer(
     _Quoted,
     lambda d, data: d.represent_scalar("tag:yaml.org,2002:str", data, style='"'),
-    Dumper=yaml.SafeDumper,  # safe_dump 用的是 SafeDumper,必须注册到它上面
+    Dumper=yaml.SafeDumper,  # safe_dump uses SafeDumper, so register on it
 )
 
 
@@ -126,7 +171,7 @@ def load_lock() -> dict:
     out = {}
     for n, v in (data.get("sources") or {}).items():
         sha = str(v.get("sha", ""))
-        if len(sha) != 40:  # 防御:全数字 sha 曾被 YAML 当整数解析而丢失前导零
+        if len(sha) != 40:  # defense: an all-digit SHA was once parsed as int by YAML, losing leading zeros
             sha = ""
         out[n] = {**v, "sha": sha}
     return out
@@ -137,10 +182,10 @@ def source_path(src: dict, name: str) -> str:
 
 
 def source_filter(src_or_state: dict) -> dict:
-    """检出过滤规格(互斥):{'include': [...]} / {'exclude': [...]} / {}。
+    """Checkout filter spec (mutually exclusive): {'include': [...]} / {'exclude': [...]} / {}.
 
-    include → git cone 模式(白名单,git 推荐,快);
-    exclude → git non-cone 模式(黑名单,gitignore 式取反,支持嵌套路径)。
+    include → git cone mode (whitelist, git-recommended, fast);
+    exclude → git non-cone mode (blacklist, gitignore-style negation, supports nested paths).
     """
     if src_or_state.get("include"):
         return {"include": sorted(src_or_state["include"])}
@@ -153,7 +198,7 @@ def apply_filter(wt: Path, filt: dict):
     if filt.get("include"):
         git(["sparse-checkout", "set", *filt["include"]], cwd=wt)   # cone
     elif filt.get("exclude"):
-        # non-cone:先全包含(/*),再按 gitignore 语义取反剪枝(! 前缀)
+        # non-cone: include everything (/*), then prune via gitignore-style negation (! prefix)
         git(
             ["sparse-checkout", "set", "--no-cone", "/*",
              *[f"!/{p}" for p in filt["exclude"]]],
@@ -172,8 +217,9 @@ def filter_label(filt: dict) -> str:
 
 
 def cache_key(src: dict) -> str:
-    """镜像缓存键:默认按 URL(同一仓库的多条配置自动共享一个对象库),
-    可用 cache: 属性显式覆盖(如 URL 经常切换时固定缓存名)。"""
+    """Mirror cache key: defaults to the URL (multiple sources from the same repo
+    automatically share one object store); override with the cache: attribute
+    (e.g. to pin the cache name when the URL changes often)."""
     if src.get("cache"):
         return src["cache"]
     return re.sub(r"[^A-Za-z0-9._-]+", "-", src["url"]).strip("-")
@@ -186,7 +232,7 @@ def all_source_paths(cfg) -> list:
 
 
 def minimal_cover(paths: list) -> list:
-    """剔除被其他路径祖先覆盖的路径——祖先的忽略规则已涵盖后代。"""
+    """Drop paths covered by an ancestor — the ancestor's ignore rule already covers them."""
     return [
         p for p in paths
         if not any(o != p and o in p.parents for o in paths)
@@ -194,7 +240,7 @@ def minimal_cover(paths: list) -> list:
 
 
 def write_managed_block(path: Path, lines: list):
-    """在文件中维护一个带标记的托管块:每次整体重写,自我修复、不残留。"""
+    """Maintain a marked managed block in a file: rewritten wholesale each time, self-healing, no residue."""
     existing = path.read_text().splitlines() if path.exists() else []
     kept, in_block = [], False
     for ln in existing:
@@ -214,6 +260,33 @@ def write_managed_block(path: Path, lines: list):
     path.write_text(("\n".join(kept) + "\n") if kept else "")
 
 
+# ---------------------------------------------------------------- workspace root
+
+def find_root(required: bool = True):
+    """Locate the workspace root: walk up from the CWD until git-workspace.yaml is found."""
+    cur = Path.cwd()
+    for d in [cur, *cur.parents]:
+        if (d / CONFIG_NAME).exists():
+            return d
+    if required:
+        die(
+            f"{CONFIG_NAME} not found in {cur} or any parent directory"
+            " — run `git-workspace init` to create one"
+        )
+    return None
+
+
+def init_paths(root: Path):
+    """Bind all derived paths to the resolved workspace root."""
+    global ROOT, CONFIG_PATH, LOCK_PATH, DOT, CACHE, STATE_PATH
+    ROOT = root
+    CONFIG_PATH = root / CONFIG_NAME
+    LOCK_PATH = root / LOCK_NAME
+    DOT = root / ".workspace"
+    CACHE = DOT / "git-cache"
+    STATE_PATH = DOT / "state.json"
+
+
 # ---------------------------------------------------------------- config
 
 def load_config() -> dict:
@@ -221,11 +294,11 @@ def load_config() -> dict:
         die(f"missing {CONFIG_PATH.name}")
     cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
     if cfg.get("version") != 1:
-        die("workspace.yaml: unsupported version (expected: 1)")
+        die("git-workspace.yaml: unsupported version (expected: 1)")
 
     sources = cfg.get("sources") or {}
     if not sources:
-        die("workspace.yaml: no sources defined")
+        die("git-workspace.yaml: no sources defined")
 
     paths_seen = {}
     for name, src in sources.items():
@@ -239,9 +312,9 @@ def load_config() -> dict:
             die(f"source {name}: readonly must be boolean")
         if src.get("cache") and not NAME_RE.match(src["cache"]):
             die(f"source {name}: invalid cache key {src['cache']!r}")
-        # 检出过滤:include(白名单)/ exclude(黑名单),互斥
+        # checkout filters: include (whitelist) / exclude (blacklist), mutually exclusive
         if src.get("include") and src.get("exclude"):
-            die(f"source {name}: include 与 exclude 互斥,只能选其一")
+            die(f"source {name}: include and exclude are mutually exclusive — pick one")
         for key in ("include", "exclude"):
             val = src.get(key) or []
             if not isinstance(val, list) or not all(isinstance(p, str) for p in val):
@@ -249,7 +322,7 @@ def load_config() -> dict:
             for p in val:
                 if ".." in Path(p).parts:
                     die(f"source {name}: {key} path escapes: {p}")
-        # 装配位置校验
+        # assembly location validation
         path = source_path(src, name)
         parts = Path(path).parts
         if not parts or ".." in parts or "." in parts:
@@ -259,13 +332,13 @@ def load_config() -> dict:
         if len(parts) == 1 and parts[0] in RESERVED_FILES:
             die(f"source {name}: path collides with workspace file {parts[0]!r}")
         if path in paths_seen:
-            die(f"source {name}: duplicate path {path!r} (与 {paths_seen[path]} 冲突)")
+            die(f"source {name}: duplicate path {path!r} (conflicts with {paths_seen[path]})")
         target = ROOT / path
         if target.exists() and not target.is_dir():
-            die(f"source {name}: path {path!r} 被既有文件占用")
+            die(f"source {name}: path {path!r} is occupied by an existing file")
         paths_seen[path] = name
 
-    # 嵌套规则:只读源内部不允许再装配其他源
+    # nesting rule: no source may be assembled inside a read-only source
     for name, src in sources.items():
         if not src.get("readonly"):
             continue
@@ -273,7 +346,7 @@ def load_config() -> dict:
         for other, src2 in sources.items():
             p2 = Path(source_path(src2, other))
             if other != name and p in p2.parents:
-                die(f"source {other}: 不允许嵌套装配进只读源 {name} ({p})")
+                die(f"source {other}: cannot nest assembly inside read-only source {name} ({p})")
 
     cfg["sources"] = sources
     return cfg
@@ -282,7 +355,7 @@ def load_config() -> dict:
 # ---------------------------------------------------------------- git plumbing
 
 def ensure_cache(src: dict, fetched: set):
-    """clone --mirror 或增量更新对象缓存;同一缓存键一次 sync 内只 fetch 一次。"""
+    """clone --mirror or incrementally update the object cache; one fetch per cache key per sync."""
     key = cache_key(src)
     cache = CACHE / f"{key}.git"
     if key in fetched:
@@ -327,19 +400,21 @@ def _chmod_no_follow(p: Path, mode: int):
 
 
 def set_locked(wt: Path, on: bool):
-    """文件系统级只读锁:锁定后任何编辑/新建/删除都失败,只有本工具解锁后可写。"""
+    """Filesystem-level read-only lock: once locked, every edit/create/delete fails;
+    only this tool can unlock and write. (On Windows this maps to the read-only
+    file attribute, which os.access(W_OK) also honors.)"""
     if on:
         for dirpath, _, filenames in os.walk(wt):
             for f in filenames:
                 p = Path(dirpath) / f
                 if not p.is_symlink():
                     _chmod_no_follow(p, p.stat().st_mode & ~0o222)
-        for dirpath, _, _ in os.walk(wt, topdown=False):  # 目录自底向上,最后封门
+        for dirpath, _, _ in os.walk(wt, topdown=False):  # dirs bottom-up, seal the door last
             p = Path(dirpath)
             if not p.is_symlink():
                 _chmod_no_follow(p, p.stat().st_mode & ~0o222)
     else:
-        for dirpath, _, _ in os.walk(wt):                # 目录自顶向下,先开门
+        for dirpath, _, _ in os.walk(wt):                # dirs top-down, open the door first
             p = Path(dirpath)
             if not p.is_symlink():
                 _chmod_no_follow(p, p.stat().st_mode | 0o200)
@@ -353,7 +428,8 @@ def set_locked(wt: Path, on: bool):
 # ---------------------------------------------------------------- worktrees
 
 def materialize_source(name, sha, filt, readonly, path, cache, state):
-    """在工程装配位置创建/更新真实 worktree;按需过滤检出;readonly 源同步后上锁。"""
+    """Create/update a real worktree at the assembly location; apply the checkout
+    filter; lock read-only sources after syncing."""
     wt = ROOT / path
     prev = state.get("sources", {}).get(name, {})
     label = filter_label(filt)
@@ -365,21 +441,23 @@ def materialize_source(name, sha, filt, readonly, path, cache, state):
         filter_changed = source_filter(prev) != filt
         empty = not any(e.name != ".git" for e in wt.iterdir())
 
-        # 安全闸:基准是"上次同步点"而非目标 SHA——在 tag/分支间切换时,
-        # HEAD 天然含有目标没有的上游提交,那不算本地工作
+        # Safety gate: the baseline is the *last sync point*, not the target SHA —
+        # when switching between tags/branches, HEAD naturally contains upstream
+        # commits the target lacks, and that is not local work.
         if head != sha:
             if git(["status", "--porcelain"], cwd=wt):
                 raise WorkspaceError(
-                    f"{name}: 工作树有未提交改动。请先在 {path} 内 "
-                    f"git commit/stash,再执行 sync"
+                    f"{name}: worktree has uncommitted changes — commit or stash"
+                    f" them in {path}/ first, then re-run sync"
                 )
             prev_sha = prev.get("sha")
             if prev_sha and prev_sha != head:
                 ahead = git(["rev-list", "--count", f"{prev_sha}..HEAD"], cwd=wt)
                 if ahead not in ("0", ""):
                     raise WorkspaceError(
-                        f"{name}: 相对上次同步点 {prev_sha[:12]} 存在 {ahead} 个本地提交,"
-                        f"sync 拒绝覆盖。请先在 {path} 内推送/处理,再执行 sync"
+                        f"{name}: {ahead} local commit(s) since last sync point"
+                        f" {prev_sha[:12]} — sync refuses to overwrite; push or"
+                        f" resolve them in {path}/ first, then re-run sync"
                     )
 
         changed = filter_changed or (head != sha) or empty
@@ -390,7 +468,7 @@ def materialize_source(name, sha, filt, readonly, path, cache, state):
                 apply_filter(wt, filt)
             if head != sha:
                 git(["checkout", "--quiet", "--detach", sha], cwd=wt)
-            if empty:  # 防御:no-checkout 后未物化的空 worktree
+            if empty:  # defense: empty worktree never materialized after --no-checkout
                 git(["read-tree", "-mu", "HEAD"], cwd=wt)
         finally:
             if readonly:
@@ -402,7 +480,7 @@ def materialize_source(name, sha, filt, readonly, path, cache, state):
     if filt:
         git(["worktree", "add", "--detach", "--no-checkout", "--quiet", str(wt), sha], cwd=cache)
         apply_filter(wt, filt)
-        # --no-checkout 的 index 为空,过滤设置无条目可应用,需物化一次
+        # the --no-checkout index is empty, so the filter had no entries to apply — materialize once
         git(["read-tree", "-mu", "HEAD"], cwd=wt)
     else:
         git(["worktree", "add", "--detach", "--quiet", str(wt), sha], cwd=cache)
@@ -411,25 +489,28 @@ def materialize_source(name, sha, filt, readonly, path, cache, state):
     info(f"{path}/  created @ {sha[:12]} ({label})")
 
 
-# ---------------------------------------------------------------- git 过滤(全自动)
+# ---------------------------------------------------------------- git filters (fully automatic)
 
 def ensure_git_filters(cfg):
-    """按装配路径精确管理 git 忽略,全部写入托管块(每次 sync 整体重写):
+    """Manage git ignores precisely by assembly path, all written as managed
+    blocks (rewritten wholesale on every sync):
 
-    - 外层仓库:忽略每个不被其他源覆盖的装配路径(+ .workspace)
-      → 任何不在源装配路径下的目录自动成为"本地代码",被外层 git 跟踪
-    - 嵌套装配:子路径写入父 worktree 的 exclude(linked worktree 的
-      info/exclude 位于 commondir,而非 per-worktree 目录)
+    - outer repo: ignore each assembly path not covered by another source (+ .workspace)
+      → any directory that is not a source assembly path automatically becomes
+        "local code", tracked by the outer git repo
+    - nested assembly: child paths are written into the parent worktree's exclude
+      (a linked worktree's info/exclude lives in the commondir, not the
+      per-worktree directory)
     """
     paths = all_source_paths(cfg)
 
-    # 外层仓库
+    # outer repo
     if (ROOT / ".git").exists():
         lines = ["/.workspace/"]
         lines += [f"/{p.as_posix()}/" for p in minimal_cover(paths)]
         write_managed_block(ROOT / ".git" / "info" / "exclude", lines)
 
-    # 父级 worktree 忽略嵌套子仓库(按父分组)
+    # parent worktrees ignore nested child repos (grouped by parent)
     by_parent = {}
     for p in paths:
         for o in paths:
@@ -444,35 +525,63 @@ def ensure_git_filters(cfg):
             common = wt / common
         write_managed_block(common / "info" / "exclude", sorted(rels))
 
-    info("git 过滤已按配置刷新(外层 exclude + 父级 worktree exclude)")
+    info("git filters refreshed from config (outer exclude + parent worktree excludes)")
+
+
+def write_hook(path: Path):
+    """Write the commit-protection hook (self-healing: rewritten on every sync).
+    It prefers git-workspace from PATH and falls back to ./git-workspace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(HOOK_SCRIPT)
+    path.chmod(path.stat().st_mode | 0o111)
 
 
 def ensure_hooks():
-    """外层 git 仓库自动启用 pre-commit 防护(拦截三方代码误提交)。"""
+    """Auto-enable pre-commit protection in the outer git repo (blocks
+    accidentally committing third-party code)."""
     if not (ROOT / ".git").exists():
         return
+    write_hook(ROOT / ".githooks" / "pre-commit")
     try:
         cur = git(["config", "--get", "core.hooksPath"], cwd=ROOT)
     except WorkspaceError:
         cur = ""
     if cur != ".githooks":
         git(["config", "core.hooksPath", ".githooks"], cwd=ROOT)
-        info("pre-commit 防护钩子已启用 (core.hooksPath=.githooks)")
+        info("commit-protection hook enabled (core.hooksPath=.githooks)")
 
 
 def protected_paths(cfg) -> set:
-    """受保护路径 = 全部源装配路径(精确)+ .workspace。"""
+    """Protected paths = all source assembly paths (exact) + .workspace."""
     return {".workspace"} | {p.as_posix() for p in all_source_paths(cfg)}
 
 
 # ---------------------------------------------------------------- commands
+
+def cmd_init(_args):
+    """Scaffold a new workspace: starter config + commit-protection hooks."""
+    if CONFIG_PATH.exists():
+        die(f"{CONFIG_NAME} already exists — nothing to do")
+    CONFIG_PATH.write_text(CONFIG_TEMPLATE)
+    info(f"created {CONFIG_NAME} (edit it to declare your sources)")
+
+    write_hook(ROOT / ".githooks" / "pre-commit")
+    info("created .githooks/pre-commit")
+    if (ROOT / ".git").exists():
+        git(["config", "core.hooksPath", ".githooks"], cwd=ROOT)
+        info("enabled commit protection (core.hooksPath=.githooks)")
+    else:
+        info("note: not a git repository — run `git init` to enable commit protection")
+
+    step(f"done. next: edit {CONFIG_NAME}, then run `git-workspace sync`")
+
 
 def cmd_sync(args):
     cfg = load_config()
     state = load_state()
     resolved = {}
 
-    # 阶段一:拉取 + 解析(同一 URL 的多条配置共享一个镜像缓存)
+    # Phase 1: fetch + resolve (sources sharing a URL share one mirror cache)
     caches, fetched = {}, set()
     for name, src in cfg["sources"].items():
         step(f"source: {name}  ({src['url']})")
@@ -481,7 +590,7 @@ def cmd_sync(args):
         resolved[name] = sha
         info(f"{src['revision']}  ->  {sha}")
 
-    # --locked:严格复现模式,解析结果必须与 lock 完全一致(CI/团队协作)
+    # --locked: strict reproduction mode — resolved SHAs must match the lock exactly (CI / team collaboration)
     if getattr(args, "locked", False):
         lock = load_lock()
         violations = [
@@ -491,14 +600,16 @@ def cmd_sync(args):
         ]
         unknown = [n for n in cfg["sources"] if n not in lock]
         if violations or unknown:
-            lines = [f"  {n}: lock {ls[:12]} != 解析 {rs[:12]}" for n, ls, rs in violations]
-            lines += [f"  {n}: lock 中不存在" for n in unknown]
+            lines = [f"  {n}: lock {ls[:12]} != resolved {rs[:12]}" for n, ls, rs in violations]
+            lines += [f"  {n}: not present in lock" for n in unknown]
             raise WorkspaceError(
-                "--locked 模式拒绝执行,以下源与 lock 不一致:\n" + "\n".join(lines)
-                + "\n如为有意升级:先执行 ./workspace sync(不带 --locked)更新 lock,验证后与 workspace.yaml 一并提交"
+                "--locked mode refused to run: the following sources disagree with the lock:\n"
+                + "\n".join(lines)
+                + "\nIf this is an intentional upgrade: run `git-workspace sync` (without"
+                " --locked) to update the lock, verify, then commit git-workspace.yaml and the lock together"
             )
 
-    # 阶段二:物化 worktree(父目录先建 → 按装配路径深度排序)
+    # Phase 2: materialize worktrees (parents first — ordered by assembly path depth)
     ordered = sorted(
         cfg["sources"].items(),
         key=lambda kv: len(Path(source_path(kv[1], kv[0])).parts),
@@ -536,7 +647,7 @@ def cmd_sync(args):
         },
     }
     LOCK_PATH.write_text(
-        "# Generated by `workspace sync` — 锁定各源的 commit,可提交入库以保证团队复现\n"
+        "# Generated by `git-workspace sync` — locks each source's commit; commit this file for team-wide reproduction\n"
         + yaml.safe_dump(lock, sort_keys=False, allow_unicode=True)
     )
     ensure_hooks()
@@ -550,17 +661,17 @@ def cmd_status(_args):
         path = source_path(src, name)
         wt = ROOT / path
         if not (wt / ".git").exists():
-            print(f"  {name:<14} {path}/  (not materialized — run `workspace sync`)")
+            print(f"  {name:<14} {path}/  (not materialized — run `git-workspace sync`)")
             continue
         head = worktree_head(wt) or "?"
         dirty = git(["status", "--porcelain"], cwd=wt)
         ro_cfg = bool(src.get("readonly", False))
         ro_state = "read-only" if ro_cfg else "writable"
         if ro_cfg and not is_locked(wt):
-            ro_state = "read-only (未锁定!)"
+            ro_state = "read-only (NOT LOCKED!)"
         dirty_state = "DIRTY" if dirty else "clean"
         if dirty and ro_cfg:
-            dirty_state = "DIRTY(只读源出现改动?!)"
+            dirty_state = "DIRTY (changes in a read-only source?!)"
         print(
             f"  {name:<14} {path}/  {head[:12]}  rev={src['revision']}"
             f"  {dirty_state}  {ro_state}  {filter_label(source_filter(src))}"
@@ -569,13 +680,13 @@ def cmd_status(_args):
 
 
 def cmd_outdated(_args):
-    """对照 lock 检查各源:revision 当前解析值是否漂移、上游有无更新的 tag。"""
+    """Compare each source against the lock: has the revision drifted, and are there newer upstream tags?"""
     cfg = load_config()
     lock = load_lock()
     for name, src in cfg["sources"].items():
         cache = CACHE / f"{cache_key(src)}.git"
         if not cache.exists():
-            print(f"{name:<14} 无缓存 — 先执行 ./workspace sync")
+            print(f"{name:<14} no cache — run `git-workspace sync` first")
             continue
         git(["fetch", "--prune", "--quiet", "origin"], cwd=cache)
         remote = resolve_sha(cache, src["revision"])
@@ -589,17 +700,28 @@ def cmd_outdated(_args):
         drift = "DRIFT" if (locked and locked != remote) else "locked" if locked else "unlocked"
         newer = ""
         if latest_sha and latest_sha != locked and latest_sha != remote:
-            newer = f"  ← 上游有更新版本: {latest_tag}"
+            newer = f"  <- newer upstream version: {latest_tag}"
         print(
             f"{name:<14} rev={src['revision']:<10} lock={locked[:12] or '-':<12} "
-            f"解析={remote[:12]}  最新tag={latest_tag:<10} [{drift}]{newer}"
+            f"resolved={remote[:12]}  latest-tag={latest_tag:<10} [{drift}]{newer}"
         )
 
 
 def cmd_guard(_args):
-    """提交防护(git pre-commit 钩子调用):拒绝将装配目录提交进外层仓库。"""
-    cfg = load_config()
-    protected = protected_paths(cfg)
+    """Commit protection (called by the git pre-commit hook): refuse committing
+    assembly directories into the outer repo. Deliberately lenient: a missing,
+    empty or unparseable config never blocks commits — `sync` reports those."""
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+    except (yaml.YAMLError, OSError):
+        sys.exit(0)
+    sources = cfg.get("sources") or {}
+    if not isinstance(sources, dict) or not sources:
+        sys.exit(0)  # no sources → no assembly paths → nothing to protect
+    protected = {".workspace"}
+    for n, s in sources.items():
+        p = (s.get("path") or n) if isinstance(s, dict) else n
+        protected.add(Path(p).as_posix())
     staged = git(["diff", "--cached", "--name-only"], cwd=ROOT).splitlines()
     bad = sorted({
         f for f in staged
@@ -611,14 +733,14 @@ def cmd_guard(_args):
         if len(parts) >= 5 and parts[1] == "160000":
             gitlinks.append(line.split("\t", 1)[-1])
     if bad or gitlinks:
-        print("✋ workspace guard 拒绝提交:", file=sys.stderr)
+        print("✋ git-workspace guard rejected this commit:", file=sys.stderr)
         for f in sorted(set(bad) | set(gitlinks)):
             print(f"     {f}", file=sys.stderr)
         print(
-            "\n   规则:\n"
-            "   - 装配目录(各源 worktree)→ 用各自的 git 提交(上游走 PR)\n"
-            "   - 外层仓库 → 只提交 workspace.yaml/lock、文档、工具与本地代码目录\n"
-            "   - 误操作 → git reset 移出暂存区后重试",
+            "\n   Rules:\n"
+            "   - Assembly dirs (source worktrees) → commit inside their own repo (upstream via PR)\n"
+            "   - Outer repo → commit only git-workspace.yaml/lock, docs, tooling and local code dirs\n"
+            "   - Mistake → unstage with `git reset` and retry",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -643,7 +765,7 @@ def cmd_clean(args):
                 git(["worktree", "prune"], cwd=cache)
             info(f"removed worktree {path}/")
 
-    # 回收空目录(自底向上)
+    # reclaim empty directories (bottom-up)
     for d in sorted(all_source_paths(cfg), key=lambda p: -len(p.parts)):
         d = ROOT / d
         while d != ROOT and d.is_dir() and not any(d.iterdir()):
@@ -662,28 +784,65 @@ def cmd_clean(args):
 
 # ---------------------------------------------------------------- main
 
+EPILOG = """examples:
+  git-workspace init                create a starter git-workspace.yaml and commit-protection hooks
+  git-workspace sync                fetch sources, materialize worktrees, refresh the lock
+  git-workspace sync --locked       strict mode: fail on any mismatch with the lock (CI)
+  git-workspace status              show per-source SHA, dirty, filter and read-only state
+  git-workspace outdated            check lock drift and newer upstream tags
+  git-workspace clean [--all]       remove worktrees (--all also removes the git cache)
+"""
+
+
 def main():
-    parser = argparse.ArgumentParser(prog="workspace", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        prog="git-workspace",
+        description=__doc__.splitlines()[0],
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {__version__}",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p_sync = sub.add_parser("sync", help="拉取/更新源,物化 worktree,刷新 git 过滤")
+    sub.add_parser("init", help="create a starter git-workspace.yaml and commit-protection hooks")
+    p_sync = sub.add_parser("sync", help="fetch/update sources, materialize worktrees, refresh git filters")
     p_sync.add_argument(
         "--locked",
         action="store_true",
-        help="严格模式:解析结果必须与 workspace.lock.yaml 一致,否则失败(CI/复现用)",
+        help="strict mode: resolved SHAs must match git-workspace.lock.yaml or fail (CI / reproduction)",
     )
-    sub.add_parser("status", help="查看各源状态")
-    sub.add_parser("outdated", help="检查各源相对 lock 的漂移与上游新版本")
-    sub.add_parser("guard", help="提交防护检查(由 git pre-commit 钩子调用)")
-    p_clean = sub.add_parser("clean", help="删除 worktree")
-    p_clean.add_argument("--all", action="store_true", help="连同 .workspace/git-cache 一起删除")
+    sub.add_parser("status", help="show per-source status")
+    sub.add_parser("outdated", help="check lock drift and newer upstream versions")
+    sub.add_parser("guard", help="commit-protection check (called by the git pre-commit hook)")
+    p_clean = sub.add_parser("clean", help="remove worktrees")
+    p_clean.add_argument("--all", action="store_true", help="also remove .workspace/git-cache")
+    sub.add_parser("version", help="print version and exit")
 
     args = parser.parse_args()
+
     try:
+        # `version` needs no workspace; `init` creates one in the CWD.
+        if args.cmd == "version":
+            print(f"git-workspace {__version__}")
+            return
+        if args.cmd == "init":
+            init_paths(Path.cwd())
+            cmd_init(args)
+            return
+        # `guard` is lenient: no config → no assembly paths → nothing to protect.
+        if args.cmd == "guard":
+            root = find_root(required=False)
+            if root is None:
+                sys.exit(0)
+            init_paths(root)
+            cmd_guard(args)
+            return
+        init_paths(find_root())
         {
             "sync": cmd_sync,
             "status": cmd_status,
             "outdated": cmd_outdated,
-            "guard": cmd_guard,
             "clean": cmd_clean,
         }[args.cmd](args)
     except WorkspaceError as e:

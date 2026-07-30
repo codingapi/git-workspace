@@ -1,7 +1,6 @@
 # ===== 投影层生成物(由 ./workspace sync 管理,永不入库)=====
 .workspace/
 .sources/
-product/
 
 # ===== 通用 =====
 node_modules/

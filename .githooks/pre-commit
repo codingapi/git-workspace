@@ -1,3 +1,7 @@
 #!/bin/sh
-# 提交防护:策略由引擎按 workspace.yaml 动态计算(受保护路径 = 所有装配目录 + 视窗)
-exec ./workspace guard
+# Commit protection: policy is computed dynamically by the engine from
+# git-workspace.yaml (protected paths = all assembly dirs + .workspace).
+if command -v git-workspace >/dev/null 2>&1; then
+    exec git-workspace guard
+fi
+exec ./git-workspace guard

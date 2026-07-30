@@ -1,0 +1,41 @@
+# Example configuration for git-workspace.
+# Try it:  cp example.yaml git-workspace.yaml && git-workspace sync
+# Full syntax reference: see README.md
+
+version: 1
+
+sources:
+  # ── Development repos: full checkout, assembled at project locations ────
+  # path = assembly location (may be nested); no filter attributes = full checkout
+  flow-engine:
+    url: git@github.com:codingapi/flow-engine.git
+    revision: v0.0.66
+    path: flow-engine
+
+  flow-frontend:
+    url: git@github.com:codingapi/flow-frontend.git
+    revision: v0.0.67
+    path: flow-engine/web          # nested assembly: the parent repo ignores this dir automatically
+
+  # ── Checkout filters (pick one, mutually exclusive) + location (path) ───
+  # include: whitelist — check out only the listed dirs (git cone mode: fast, git-recommended; top-level files always kept)
+  # exclude: blacklist — check out "everything else" (git non-cone mode: supports nested paths like a/b/c)
+  # path:    where to assemble it. filter + location = "take this content, put it there"
+  #
+  # ── Same repo × multiple paths × different subsets = multiple entries ───
+  # Each entry = one independent worktree (its own filter/HEAD/read-only state).
+  # Same url → the engine shares one mirror cache automatically, no duplicate downloads.
+  fastjson2-core:
+    url: git@github.com:alibaba/fastjson2.git
+    revision: 2.0.63               # pin a tag: version snapshot
+    path: frameworks/fastjson2-core
+    include: [core]                # whitelist: only the core module
+    readonly: true                 # third-party dependency: filesystem read-only
+
+  fastjson2-ext:
+    url: git@github.com:alibaba/fastjson2.git   # same repo
+    revision: 2.0.63                            # same version (could differ)
+    path: frameworks/fastjson2-ext              # different assembly location
+    include: [extension]                        # different subset
+    # exclude: [core/src/test]                  # blacklist form (mutually exclusive with include)
+    readonly: true
