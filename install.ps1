@@ -78,14 +78,26 @@ try {
         Write-Error "python not found - install Python 3.8+ (https://python.org)"
     }
 
+    # Native commands emit diagnostics on stderr. With $ErrorActionPreference
+    # = "Stop", Windows PowerShell 5.1 turns that stderr into a *terminating*
+    # NativeCommandError, which would abort the installer the moment the probe
+    # below reports "PyYAML missing" (an ImportError traceback on stderr) -
+    # before the pip-install fallback could run. Relax the preference around
+    # the external calls and judge success by $LASTEXITCODE instead.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
     & $PyExe @PyArgs -c "import yaml" *> $null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "==> PyYAML missing - attempting: $PyExe $($PyArgs -join ' ') -m pip install --user pyyaml"
         & $PyExe @PyArgs -m pip install --user pyyaml
         if ($LASTEXITCODE -ne 0) {
+            $ErrorActionPreference = $prevEAP
             Write-Error "could not install PyYAML - install it manually (pip install pyyaml)"
         }
     }
+
+    $ErrorActionPreference = $prevEAP
 
     # ---- install: script + cmd shim + user PATH ----------------------------
     New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
