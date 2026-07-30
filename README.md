@@ -84,6 +84,42 @@ projections:
 5. **冲突保护**:投影目标已存在非投影内容(真实目录/文件/他人链接)时
    直接报错拒绝覆盖,绝不静默破坏用户数据。
 
+## 版本管理:三层模型
+
+| 层 | 管什么 | 谁来管 | 升级方式 |
+|---|---|---|---|
+| **源版本** | 每个依赖仓库取哪个快照 | `workspace.yaml` 的 revision(可读 tag)+ `workspace.lock.yaml`(精确 SHA) | 显式 bump commit |
+| **产品版本** | 聚合体整体的版本号 | 外层仓库自己的 git tag | 发版 = 打 tag(tag 时刻的 lock = 完整 BOM) |
+| **生态内部版本** | 各源内部 pom/package.json 的版本号 | 各自生态工具 | 随源快照 bump 自动跟随,不用手动碰 |
+
+### 源版本:钉 tag,锁 SHA
+
+- `revision` 写 tag(意图,可读);lock 记 SHA(事实,精确)。无 tag 的仓库用完整 SHA + 注释。
+- 团队/CI 一律 `./workspace sync --locked`:解析与 lock 不一致即失败
+  ——同 `pnpm install --frozen-lockfile` / `cargo build --locked` 语义。
+- `./workspace outdated`:检查各源相对 lock 的漂移与上游新 tag。
+
+### 升级 = 显式事件(不是漂移)
+
+任何三方的版本升级,都是一个可评审、可回滚的提交:
+
+```bash
+# 1. 改 workspace.yaml 的 revision(如 fastjson2 2.0.63 → 2.0.64)
+# 2. 接受新版本,更新 lock
+./workspace sync
+# 3. 构建 + 测试(前端 pnpm / 后端 maven)
+# 4. 配置与 lock 一起提交 —— 这个提交就是"版本升级"本身
+git commit -am "bump fastjson2 2.0.63 → 2.0.64"
+```
+
+### 产品版本:git tag 即发布
+
+外层仓库的 tag = 产品版本:tag v1.0.0 时刻的 `workspace.lock.yaml` 钉死了
+全部源的 SHA → 任何人 `git checkout v1.0.0 && ./workspace sync --locked`
+精确复现该版本的源码组合,再 `mvn package` / `pnpm build` 即得制品。
+号码维护:后端用 maven `${revision}`(CI-friendly versions),前端用
+`pnpm -r` 协调 bump,两者与外层 tag 对齐即可。
+
 ## 只读与提交防护
 
 **三方源文件系统级只读。** 源上配置 `readonly: true`,sync 完成后该 worktree

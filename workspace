@@ -82,6 +82,33 @@ def load_state() -> dict:
     return {}
 
 
+def load_lock() -> dict:
+    if not LOCK_PATH.exists():
+        return {}
+    try:
+        data = yaml.safe_load(LOCK_PATH.read_text()) or {}
+    except yaml.YAMLError:
+        return {}
+    out = {}
+    for n, v in (data.get("sources") or {}).items():
+        sha = str(v.get("sha", ""))
+        if len(sha) != 40:  # 防御:全数字 sha 曾被 YAML 当整数解析而丢失前导零
+            sha = ""
+        out[n] = {**v, "sha": sha}
+    return out
+
+
+class _Quoted(str):
+    """YAML 序列化时强制加引号——sha 可能全为数字,裸标量会被读成整数。"""
+
+
+yaml.add_representer(
+    _Quoted,
+    lambda d, data: d.represent_scalar("tag:yaml.org,2002:str", data, style='"'),
+    Dumper=yaml.SafeDumper,  # safe_dump 用的是 SafeDumper,必须注册到它上面
+)
+
+
 def save_state(state: dict):
     DOT.mkdir(parents=True, exist_ok=True)
     STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n")
@@ -233,19 +260,23 @@ def materialize_source(name: str, sha: str, sparse: list, readonly: bool, state:
         sparse_changed = sorted(prev.get("sparse", [])) != sorted(sparse)
         empty = not any(e.name != ".git" for e in wt.iterdir())
 
-        # 安全闸:有未提交改动或本地提交时拒绝覆盖,避免静默丢失工作
+        # 安全闸:有未提交改动,或相对"上次同步点"有本地提交时,拒绝覆盖
+        # 注意:基准必须是上次同步的 SHA(prev_sha),而非目标 SHA——
+        # 在 tag/分支之间切换时,HEAD 天然含有目标没有的上游提交,那不是本地工作
         if head != sha:
             if git(["status", "--porcelain"], cwd=wt):
                 raise WorkspaceError(
                     f"{name}: 工作树有未提交改动。请先在 .sources/{name} 内 "
                     f"git commit/stash,再执行 sync"
                 )
-            ahead = git(["rev-list", "--count", f"{sha}..HEAD"], cwd=wt)
-            if ahead not in ("0", ""):
-                raise WorkspaceError(
-                    f"{name}: 存在 {ahead} 个本地提交,sync 切换版本会使其脱离。"
-                    f"请先在 .sources/{name} 内推送/处理,再执行 sync"
-                )
+            prev_sha = prev.get("sha")
+            if prev_sha and prev_sha != head:
+                ahead = git(["rev-list", "--count", f"{prev_sha}..HEAD"], cwd=wt)
+                if ahead not in ("0", ""):
+                    raise WorkspaceError(
+                        f"{name}: 相对上次同步点 {prev_sha[:12]} 存在 {ahead} 个本地提交,"
+                        f"sync 拒绝覆盖。请先在 .sources/{name} 内推送/处理,再执行 sync"
+                    )
 
         changed = sparse_changed or (head != sha) or empty
         if is_locked(wt):
@@ -329,19 +360,40 @@ def project_links(projections: list, state: dict) -> dict:
 
 # ---------------------------------------------------------------- commands
 
-def cmd_sync(_args):
+def cmd_sync(args):
     cfg = load_config()
     state = load_state()
     resolved = {}
 
+    # 阶段一:拉取 + 解析
     for name, src in cfg["sources"].items():
         step(f"source: {name}  ({src['url']})")
         cache = ensure_cache(name, src["url"])
         sha = resolve_sha(cache, src["revision"])
         resolved[name] = sha
         info(f"{src['revision']}  ->  {sha}")
+
+    # --locked:严格复现模式,解析结果必须与 lock 完全一致(CI/团队协作)
+    if getattr(args, "locked", False):
+        lock = load_lock()
+        violations = [
+            (n, lock[n]["sha"], resolved[n])
+            for n in cfg["sources"]
+            if n in lock and lock[n].get("sha") != resolved[n]
+        ]
+        unknown = [n for n in cfg["sources"] if n not in lock]
+        if violations or unknown:
+            lines = [f"  {n}: lock {ls[:12]} != 解析 {rs[:12]}" for n, ls, rs in violations]
+            lines += [f"  {n}: lock 中不存在" for n in unknown]
+            raise WorkspaceError(
+                "--locked 模式拒绝执行,以下源与 lock 不一致:\n" + "\n".join(lines)
+                + "\n如为有意升级:先执行 ./workspace sync(不带 --locked)更新 lock,验证后与 workspace.yaml 一并提交"
+            )
+
+    # 阶段二:物化 worktree
+    for name, src in cfg["sources"].items():
         materialize_source(
-            name, sha, src.get("sparse") or [], bool(src.get("readonly", False)), state
+            name, resolved[name], src.get("sparse") or [], bool(src.get("readonly", False)), state
         )
 
     step("projections")
@@ -364,7 +416,7 @@ def cmd_sync(_args):
             name: {
                 "url": src["url"],
                 "revision": src["revision"],
-                "sha": resolved[name],
+                "sha": _Quoted(resolved[name]),
             }
             for name, src in cfg["sources"].items()
         },
@@ -418,6 +470,34 @@ def cmd_status(_args):
     print(f"Lock: {LOCK_PATH.name} {'present' if LOCK_PATH.exists() else 'absent'}")
 
 
+def cmd_outdated(_args):
+    """对照 lock 检查各源:revision 当前解析值是否漂移、上游有无更新的 tag。"""
+    cfg = load_config()
+    lock = load_lock()
+    for name, src in cfg["sources"].items():
+        cache = CACHE / f"{name}.git"
+        if not cache.exists():
+            print(f"{name:<14} 无缓存 — 先执行 ./workspace sync")
+            continue
+        git(["fetch", "--prune", "--quiet", "origin"], cwd=cache)
+        remote = resolve_sha(cache, src["revision"])
+        locked = lock.get(name, {}).get("sha", "")
+        tags = git(["tag", "--sort=-creatordate"], cwd=cache).splitlines()
+        latest_tag = tags[0] if tags else "-"
+        try:
+            latest_sha = resolve_sha(cache, latest_tag) if tags else ""
+        except WorkspaceError:
+            latest_sha = ""
+        drift = "DRIFT" if (locked and locked != remote) else "locked" if locked else "unlocked"
+        newer = ""
+        if latest_sha and latest_sha != locked and latest_sha != remote:
+            newer = f"  ← 上游有更新版本: {latest_tag}"
+        print(
+            f"{name:<14} rev={src['revision']:<10} lock={locked[:12] or '-':<12} "
+            f"解析={remote[:12]}  最新tag={latest_tag:<10} [{drift}]{newer}"
+        )
+
+
 def cmd_clean(args):
     cfg = load_config()
     state = load_state()
@@ -461,14 +541,22 @@ def cmd_clean(args):
 def main():
     parser = argparse.ArgumentParser(prog="workspace", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("sync", help="拉取/更新源,物化 worktree,重建投影")
+    p_sync = sub.add_parser("sync", help="拉取/更新源,物化 worktree,重建投影")
+    p_sync.add_argument(
+        "--locked",
+        action="store_true",
+        help="严格模式:解析结果必须与 workspace.lock.yaml 一致,否则失败(CI/复现用)",
+    )
     sub.add_parser("status", help="查看源与投影状态")
+    sub.add_parser("outdated", help="检查各源相对 lock 的漂移与上游新版本")
     p_clean = sub.add_parser("clean", help="删除 worktree 与投影")
     p_clean.add_argument("--all", action="store_true", help="连同 .workspace/git-cache 一起删除")
 
     args = parser.parse_args()
     try:
-        {"sync": cmd_sync, "status": cmd_status, "clean": cmd_clean}[args.cmd](args)
+        {"sync": cmd_sync, "status": cmd_status, "outdated": cmd_outdated, "clean": cmd_clean}[
+            args.cmd
+        ](args)
     except WorkspaceError as e:
         die(str(e))
     except KeyboardInterrupt:

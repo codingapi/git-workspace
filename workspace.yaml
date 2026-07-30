@@ -4,13 +4,15 @@
 version: 1
 
 sources:
+  # 一律钉 tag(可读的版本快照);确无 tag 的仓库用完整 SHA + 注释说明
+  # 升级 = 改这里的 revision → sync → 验证 → 连 lock 一起提交(显式事件,不漂移)
   flow-engine:
     url: https://github.com/codingapi/flow-engine.git
-    revision: refs/heads/main
+    revision: v0.0.66
 
   flow-frontend:
     url: https://github.com/codingapi/flow-frontend.git
-    revision: refs/heads/main
+    revision: v0.0.67
 
   fastjson2:
     url: https://github.com/alibaba/fastjson2.git
