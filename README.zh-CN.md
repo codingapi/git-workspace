@@ -93,9 +93,10 @@ iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/in
 |---|---|
 | `git-workspace init` | 在当前目录创建初始配置 + 提交防护钩子 |
 | `git-workspace sync` | 拉取全部源、物化 worktree、刷新 lock |
-| `git-workspace sync --locked` | 与 lock 不一致即失败(CI / 精确复现) |
+| `git-workspace sync --locked` | 精确检出 lock 中的 SHA;要求配置与 lock 一致;不重写 lock(CI) |
 | `git-workspace status` | 查看各源 SHA、dirty 状态、检出过滤、只读状态 |
 | `git-workspace outdated` | 检查 lock 漂移与上游新 tag |
+| `git-workspace verify` | CI 完整性校验:各源与 lock 一致、只读源干净且已锁定(失败时非零退出) |
 | `git-workspace update` | 自我更新到最新发布版本 |
 | `git-workspace clean [--all]` | 拆除 worktree(`--all` 连同对象缓存一起清除) |
 | `git-workspace version` | 打印版本(也支持 `-V` / `--version`) |
@@ -117,12 +118,18 @@ git-workspace.yaml ──▶ 引擎 ──▶ .workspace/git-cache/      (镜像
   git 与 PyYAML。它解析配置、编排顺序,所有重活(mirror clone、worktree、
   sparse-checkout、版本解析)全部委托给 git 原生能力。
 - **两种仓库角色** —— 开发型仓库全量检出、可编辑,构成你的工程本体;
-  消费型依赖配检出过滤 + 文件系统级只读锁,唯一写入者是本工具。
+  消费型依赖配检出过滤 + 文件系统级只读锁,唯一写入者是本工具——
+  `sync` 会拒绝在已被改动的只读源上运行,`verify` 也会标记它。
+  该锁是防误操作的护栏(POSIX 权限位;Windows 上为只读文件属性),
+  并非安全边界——CI 若要防篡改,请改用只读挂载与只读凭证。
 - **镜像缓存** —— `.workspace/git-cache/` 下的 bare 克隆,按 URL 键控;
   同一仓库的多个源共享同一个对象库,绝不重复下载。
 - **lock 文件** —— `sync` 将每个 revision 解析为 SHA 并写入
   `git-workspace.lock.yaml`。提交入库后,任何人(或 CI)用
-  `sync --locked` 精确复现整棵树。
+  `sync --locked` 精确复现整棵树:该模式直接检出 *lock 中的* SHA
+  (忽略 `main` 这类浮动 revision 的上游推进),要求配置的 source 集合、
+  `url`、`revision` 与 lock 一致,且绝不重写 lock。随后 `verify`
+  可断言已物化的树与 lock 一致、只读源干净且已锁定。
 - **工作区根发现** —— CLI 从当前目录逐级向上查找 `git-workspace.yaml`,
   因此无论是全局安装还是从克隆直接运行,行为完全一致。
 - **托管 git 过滤** —— 每次 sync 整体重写各仓库 exclude 文件中的标记块

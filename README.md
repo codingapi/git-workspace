@@ -95,9 +95,10 @@ To also remove a workspace's worktrees and caches first: `git-workspace clean --
 |---|---|
 | `git-workspace init` | Create a starter config + commit-protection hooks in the current directory |
 | `git-workspace sync` | Fetch sources, materialize worktrees, refresh the lock |
-| `git-workspace sync --locked` | Fail on any mismatch with the lock (CI / exact reproduction) |
+| `git-workspace sync --locked` | Reproduce the exact locked SHAs; config must match the lock; lock is not rewritten (CI) |
 | `git-workspace status` | Per-source SHA, dirty state, checkout filters, read-only state |
 | `git-workspace outdated` | Check lock drift and newer upstream tags |
+| `git-workspace verify` | Integrity check for CI: sources match the lock, read-only sources clean and locked (non-zero exit on failure) |
 | `git-workspace update` | Self-update to the latest release |
 | `git-workspace clean [--all]` | Remove worktrees (`--all` also clears the object caches) |
 | `git-workspace version` | Print the version (also `-V` / `--version`) |
@@ -123,13 +124,20 @@ git-workspace.yaml ──▶ engine ──▶ .workspace/git-cache/      (mirror
 - **Two repo roles** — development repos are checked out in full and stay
   editable where your product lives; consumed dependencies get checkout
   filters plus a filesystem-level read-only lock, and the tool is their only
-  writer.
+  writer — `sync` refuses to run against a modified read-only source and
+  `verify` flags one. The lock is an anti-accident guardrail (POSIX permission
+  bits; the read-only file attribute on Windows), not a security boundary —
+  for tamper-proof CI inputs use a read-only mount and read-only credentials.
 - **Mirror cache** — bare clones under `.workspace/git-cache/`, keyed by URL,
   so multiple sources from the same repository share one object store and are
   never downloaded twice.
 - **Lock file** — `sync` resolves each revision to a SHA and writes
   `git-workspace.lock.yaml`. Commit it, and anyone (or CI) reproduces the
-  exact tree with `sync --locked`.
+  exact tree with `sync --locked`: in that mode the engine checks out the
+  *locked* SHA verbatim (a floating revision like `main` advancing upstream is
+  ignored), requires the config's source set, `url` and `revision` to match the
+  lock, and never rewrites it. `verify` then asserts the materialized tree
+  matches the lock and that read-only sources are clean and locked.
 - **Workspace root discovery** — the CLI walks up from the current directory
   to find `git-workspace.yaml`, so it behaves identically whether installed
   globally or run from a clone.

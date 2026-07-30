@@ -29,9 +29,10 @@ Layout:
 Commands:
     git-workspace init            create a starter git-workspace.yaml and commit-protection hooks
     git-workspace sync            fetch/update all sources, materialize worktrees, refresh git filters, write the lock
-    git-workspace sync --locked   strict mode: fail on any mismatch with the lock (CI / team reproduction)
+    git-workspace sync --locked   strict mode: reproduce the exact locked SHAs; config must match the lock; lock is not rewritten (CI / team reproduction)
     git-workspace status          show per-source status
     git-workspace outdated        check lock drift and newer upstream versions
+    git-workspace verify          integrity check for CI: sources match the lock, read-only sources clean and locked
     git-workspace guard           commit protection: refuse staging assembly dirs in the outer repo (called by the git hook)
     git-workspace clean           remove worktrees (--all also removes the git cache)
     git-workspace update          self-update to the latest upstream release tag
@@ -48,7 +49,7 @@ from pathlib import Path
 
 import yaml
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 UPSTREAM_URL = "https://github.com/codingapi/git-workspace.git"
 
@@ -242,6 +243,16 @@ def minimal_cover(paths: list) -> list:
     ]
 
 
+def _is_within(child: Path, parent: Path) -> bool:
+    """True if `child` is `parent` or lives underneath it. Callers pass already
+    resolved paths. (Path.is_relative_to is 3.9+; this tool targets 3.8.)"""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def write_managed_block(path: Path, lines: list):
     """Maintain a marked managed block in a file: rewritten wholesale each time, self-healing, no residue."""
     existing = path.read_text().splitlines() if path.exists() else []
@@ -327,6 +338,8 @@ def load_config() -> dict:
                     die(f"source {name}: {key} path escapes: {p}")
         # assembly location validation
         path = source_path(src, name)
+        if Path(path).is_absolute():
+            die(f"source {name}: path must be relative to the workspace root, got absolute {path!r}")
         parts = Path(path).parts
         if not parts or ".." in parts or "." in parts:
             die(f"source {name}: invalid path {path!r}")
@@ -339,6 +352,10 @@ def load_config() -> dict:
         target = ROOT / path
         if target.exists() and not target.is_dir():
             die(f"source {name}: path {path!r} is occupied by an existing file")
+        # Containment: resolve both sides so a symlink/junction in an ancestor
+        # cannot smuggle the worktree (and later `clean`) outside the workspace.
+        if not _is_within(target.resolve(), ROOT.resolve()):
+            die(f"source {name}: path {path!r} escapes the workspace root (symlinked ancestor?)")
         paths_seen[path] = name
 
     # nesting rule: no source may be assembled inside a read-only source
@@ -443,12 +460,22 @@ def materialize_source(name, sha, filt, readonly, path, cache, state):
         head = worktree_head(wt)
         filter_changed = source_filter(prev) != filt
         empty = not any(e.name != ".git" for e in wt.iterdir())
+        dirty = git(["status", "--porcelain"], cwd=wt)
+
+        # Read-only sources: this tool is the only writer, so ANY local
+        # modification is a violation — reject even when HEAD already matches
+        # the target, otherwise the edits would silently survive the sync.
+        if readonly and dirty:
+            raise WorkspaceError(
+                f"{name}: read-only source has local modifications — sync is its"
+                f" only writer; discard them in {path}/ (or run `git-workspace"
+                " clean` and re-sync) before running sync again")
 
         # Safety gate: the baseline is the *last sync point*, not the target SHA —
         # when switching between tags/branches, HEAD naturally contains upstream
         # commits the target lacks, and that is not local work.
         if head != sha:
-            if git(["status", "--porcelain"], cwd=wt):
+            if dirty:
                 raise WorkspaceError(
                     f"{name}: worktree has uncommitted changes — commit or stash"
                     f" them in {path}/ first, then re-run sync"
@@ -632,6 +659,38 @@ def cmd_update(_args):
 def cmd_sync(args):
     cfg = load_config()
     state = load_state()
+    locked = getattr(args, "locked", False)
+    lock = load_lock() if locked else {}
+
+    # --locked: strict reproduction. The config must agree with the lock (same
+    # source set, url and revision); we then check out the *locked* SHA verbatim
+    # and never rewrite the lock. A floating revision (e.g. `main`) advancing
+    # upstream is irrelevant here — reproducing the pinned snapshot is the point.
+    if locked:
+        if not lock:
+            raise WorkspaceError(
+                "--locked requires git-workspace.lock.yaml — run `git-workspace sync` first to create it")
+        missing = [n for n in cfg["sources"] if n not in lock]
+        extra = [n for n in lock if n not in cfg["sources"]]
+        mismatches = []
+        for n, src in cfg["sources"].items():
+            if n not in lock:
+                continue
+            if not lock[n].get("sha"):
+                mismatches.append(f"  {n}: lock has no valid SHA (corrupt lock file?)")
+            if lock[n].get("url") != src["url"]:
+                mismatches.append(f"  {n}: url {lock[n].get('url')!r} (lock) != {src['url']!r} (config)")
+            if lock[n].get("revision") != src["revision"]:
+                mismatches.append(f"  {n}: revision {lock[n].get('revision')!r} (lock) != {src['revision']!r} (config)")
+        if missing or extra or mismatches:
+            lines = [f"  {n}: not present in lock" for n in missing]
+            lines += [f"  {n}: in lock but no longer in config" for n in extra]
+            lines += mismatches
+            raise WorkspaceError(
+                "--locked refused: config and lock disagree:\n" + "\n".join(lines)
+                + "\nIf this is intentional: run `git-workspace sync` (without --locked) to"
+                " re-lock, verify, then commit git-workspace.yaml and the lock together")
+
     resolved = {}
 
     # Phase 1: fetch + resolve (sources sharing a URL share one mirror cache)
@@ -639,28 +698,19 @@ def cmd_sync(args):
     for name, src in cfg["sources"].items():
         step(f"source: {name}  ({src['url']})")
         caches[name] = ensure_cache(src, fetched)
-        sha = resolve_sha(caches[name], src["revision"])
-        resolved[name] = sha
-        info(f"{src['revision']}  ->  {sha}")
-
-    # --locked: strict reproduction mode — resolved SHAs must match the lock exactly (CI / team collaboration)
-    if getattr(args, "locked", False):
-        lock = load_lock()
-        violations = [
-            (n, lock[n]["sha"], resolved[n])
-            for n in cfg["sources"]
-            if n in lock and lock[n].get("sha") != resolved[n]
-        ]
-        unknown = [n for n in cfg["sources"] if n not in lock]
-        if violations or unknown:
-            lines = [f"  {n}: lock {ls[:12]} != resolved {rs[:12]}" for n, ls, rs in violations]
-            lines += [f"  {n}: not present in lock" for n in unknown]
-            raise WorkspaceError(
-                "--locked mode refused to run: the following sources disagree with the lock:\n"
-                + "\n".join(lines)
-                + "\nIf this is an intentional upgrade: run `git-workspace sync` (without"
-                " --locked) to update the lock, verify, then commit git-workspace.yaml and the lock together"
-            )
+        if locked:
+            sha = lock[name]["sha"]
+            # the locked commit must actually exist in the just-fetched cache
+            present = git(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], cwd=caches[name])
+            if not present:
+                raise WorkspaceError(
+                    f"{name}: locked SHA {sha[:12]} not found in cache after fetch — the lock may be stale")
+            resolved[name] = sha
+            info(f"locked  ->  {sha}  (revision {src['revision']!r} ignored in --locked)")
+        else:
+            sha = resolve_sha(caches[name], src["revision"])
+            resolved[name] = sha
+            info(f"{src['revision']}  ->  {sha}")
 
     # Phase 2: materialize worktrees (parents first — ordered by assembly path depth)
     ordered = sorted(
@@ -688,23 +738,26 @@ def cmd_sync(args):
     }
     save_state(state)
 
-    lock = {
-        "version": 1,
-        "sources": {
-            name: {
-                "url": src["url"],
-                "revision": src["revision"],
-                "sha": _Quoted(resolved[name]),
-            }
-            for name, src in cfg["sources"].items()
-        },
-    }
-    LOCK_PATH.write_text(
-        "# Generated by `git-workspace sync` — locks each source's commit; commit this file for team-wide reproduction\n"
-        + yaml.safe_dump(lock, sort_keys=False, allow_unicode=True)
-    )
+    if not locked:
+        lock_out = {
+            "version": 1,
+            "sources": {
+                name: {
+                    "url": src["url"],
+                    "revision": src["revision"],
+                    "sha": _Quoted(resolved[name]),
+                }
+                for name, src in cfg["sources"].items()
+            },
+        }
+        LOCK_PATH.write_text(
+            "# Generated by `git-workspace sync` — locks each source's commit; commit this file for team-wide reproduction\n"
+            + yaml.safe_dump(lock_out, sort_keys=False, allow_unicode=True)
+        )
+        step(f"done. lock written: {LOCK_PATH.name}")
+    else:
+        step(f"done. lock unchanged (--locked): {LOCK_PATH.name}")
     ensure_hooks()
-    step(f"done. lock written: {LOCK_PATH.name}")
 
 
 def cmd_status(_args):
@@ -760,6 +813,37 @@ def cmd_outdated(_args):
         )
 
 
+def cmd_verify(_args):
+    """Integrity check for CI: every source materialized, HEAD matching the
+    lock, and every read-only source clean and filesystem-locked. Exits
+    non-zero on any problem so it can gate a pipeline."""
+    cfg = load_config()
+    lock = load_lock()
+    problems = []
+    for name, src in cfg["sources"].items():
+        path = source_path(src, name)
+        wt = ROOT / path
+        readonly = bool(src.get("readonly", False))
+        if not (wt / ".git").exists():
+            problems.append(f"{name}: not materialized — run `git-workspace sync`")
+            continue
+        head = worktree_head(wt)
+        locked_sha = lock.get(name, {}).get("sha", "")
+        if locked_sha and head != locked_sha:
+            problems.append(f"{name}: HEAD {(head or '?')[:12]} != lock {locked_sha[:12]}")
+        if readonly:
+            if git(["status", "--porcelain"], cwd=wt):
+                problems.append(f"{name}: read-only source is DIRTY")
+            if not is_locked(wt):
+                problems.append(f"{name}: read-only source is NOT LOCKED")
+    if problems:
+        print("verify failed:", file=sys.stderr)
+        for p in problems:
+            print(f"  ✗ {p}", file=sys.stderr)
+        sys.exit(1)
+    step("verify ok: all sources match the lock; read-only sources are clean and locked")
+
+
 def cmd_guard(_args):
     """Commit protection (called by the git pre-commit hook): refuse committing
     assembly directories into the outer repo. Deliberately lenient: a missing,
@@ -802,10 +886,16 @@ def cmd_guard(_args):
 
 def cmd_clean(args):
     cfg = load_config()
+    resolved_root = ROOT.resolve()
 
     for name, src in cfg["sources"].items():
         path = source_path(src, name)
         wt = ROOT / path
+        # Defense in depth: never remove anything outside the workspace root,
+        # even if a path somehow slipped past load_config validation.
+        if not _is_within(wt.resolve(), resolved_root):
+            raise WorkspaceError(
+                f"{name}: refusing to remove {path!r} — it resolves outside the workspace root")
         cache = CACHE / f"{cache_key(src)}.git"
         if (wt / ".git").exists() and cache.exists():
             if is_locked(wt):
@@ -840,9 +930,10 @@ def cmd_clean(args):
 EPILOG = """examples:
   git-workspace init                create a starter git-workspace.yaml and commit-protection hooks
   git-workspace sync                fetch sources, materialize worktrees, refresh the lock
-  git-workspace sync --locked       strict mode: fail on any mismatch with the lock (CI)
+  git-workspace sync --locked       strict mode: reproduce the exact locked SHAs; config must match the lock; lock not rewritten (CI)
   git-workspace status              show per-source SHA, dirty, filter and read-only state
   git-workspace outdated            check lock drift and newer upstream tags
+  git-workspace verify              integrity check for CI: sources match the lock, read-only sources clean and locked
   git-workspace clean [--all]       remove worktrees (--all also removes the git cache)
   git-workspace update              self-update to the latest upstream release tag
 """
@@ -864,10 +955,11 @@ def main():
     p_sync.add_argument(
         "--locked",
         action="store_true",
-        help="strict mode: resolved SHAs must match git-workspace.lock.yaml or fail (CI / reproduction)",
+        help="strict mode: check out the exact SHAs from git-workspace.lock.yaml (config must match the lock; the lock is not rewritten) — CI / reproduction",
     )
     sub.add_parser("status", help="show per-source status")
     sub.add_parser("outdated", help="check lock drift and newer upstream versions")
+    sub.add_parser("verify", help="integrity check: sources match the lock, read-only sources clean and locked (CI gate)")
     sub.add_parser("guard", help="commit-protection check (called by the git pre-commit hook)")
     p_clean = sub.add_parser("clean", help="remove worktrees")
     p_clean.add_argument("--all", action="store_true", help="also remove .workspace/git-cache")
@@ -901,6 +993,7 @@ def main():
             "sync": cmd_sync,
             "status": cmd_status,
             "outdated": cmd_outdated,
+            "verify": cmd_verify,
             "clean": cmd_clean,
         }[args.cmd](args)
     except WorkspaceError as e:
