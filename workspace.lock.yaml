@@ -9,7 +9,11 @@ sources:
     url: git@github.com:codingapi/flow-frontend.git
     revision: v0.0.67
     sha: "f9fbe7b7d808440b37e0ec7cc3c4c29c8054eb30"
-  fastjson2:
+  fastjson2-core:
+    url: git@github.com:alibaba/fastjson2.git
+    revision: 2.0.63
+    sha: "82eda3e44bfca5f282a675e3c7262efb94b95f88"
+  fastjson2-ext:
     url: git@github.com:alibaba/fastjson2.git
     revision: 2.0.63
     sha: "82eda3e44bfca5f282a675e3c7262efb94b95f88"

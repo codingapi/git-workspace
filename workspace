@@ -136,6 +136,14 @@ def source_path(src: dict, name: str) -> str:
     return src.get("path") or name
 
 
+def cache_key(src: dict) -> str:
+    """镜像缓存键:默认按 URL(同一仓库的多条配置自动共享一个对象库),
+    可用 cache: 属性显式覆盖(如 URL 经常切换时固定缓存名)。"""
+    if src.get("cache"):
+        return src["cache"]
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", src["url"]).strip("-")
+
+
 def all_source_paths(cfg) -> list:
     return sorted(
         Path(source_path(s, n)) for n, s in cfg["sources"].items()
@@ -194,6 +202,8 @@ def load_config() -> dict:
             die(f"source {name}: missing revision")
         if not isinstance(src.get("readonly", False), bool):
             die(f"source {name}: readonly must be boolean")
+        if src.get("cache") and not NAME_RE.match(src["cache"]):
+            die(f"source {name}: invalid cache key {src['cache']!r}")
         for p in src.get("sparse") or []:
             if ".." in Path(p).parts:
                 die(f"source {name}: sparse path escapes: {p}")
@@ -229,16 +239,20 @@ def load_config() -> dict:
 
 # ---------------------------------------------------------------- git plumbing
 
-def ensure_cache(name: str, url: str):
-    """clone --mirror 或增量更新对象缓存。"""
-    cache = CACHE / f"{name}.git"
+def ensure_cache(src: dict, fetched: set):
+    """clone --mirror 或增量更新对象缓存;同一缓存键一次 sync 内只 fetch 一次。"""
+    key = cache_key(src)
+    cache = CACHE / f"{key}.git"
+    if key in fetched:
+        return cache
     if cache.exists():
         git(["fetch", "--prune", "--quiet", "origin"], cwd=cache)
-        info("mirror updated")
+        info(f"mirror updated ({key})")
     else:
         CACHE.mkdir(parents=True, exist_ok=True)
-        info("mirror cloning ...")
-        git(["clone", "--mirror", "--quiet", url, str(cache)])
+        info(f"mirror cloning ... ({key})")
+        git(["clone", "--mirror", "--quiet", src["url"], str(cache)])
+    fetched.add(key)
     return cache
 
 
@@ -296,7 +310,7 @@ def set_locked(wt: Path, on: bool):
 
 # ---------------------------------------------------------------- worktrees
 
-def materialize_source(name, sha, sparse, readonly, path, state):
+def materialize_source(name, sha, sparse, readonly, path, cache, state):
     """在工程装配位置创建/更新真实 worktree;按需 sparse;readonly 源同步后上锁。"""
     wt = ROOT / path
     prev = state.get("sources", {}).get(name, {})
@@ -346,7 +360,6 @@ def materialize_source(name, sha, sparse, readonly, path, state):
         return
 
     (ROOT / path).parent.mkdir(parents=True, exist_ok=True)
-    cache = CACHE / f"{name}.git"
     if sparse:
         git(["worktree", "add", "--detach", "--no-checkout", "--quiet", str(wt), sha], cwd=cache)
         git(["sparse-checkout", "set", *sparse], cwd=wt)
@@ -420,11 +433,12 @@ def cmd_sync(args):
     state = load_state()
     resolved = {}
 
-    # 阶段一:拉取 + 解析
+    # 阶段一:拉取 + 解析(同一 URL 的多条配置共享一个镜像缓存)
+    caches, fetched = {}, set()
     for name, src in cfg["sources"].items():
         step(f"source: {name}  ({src['url']})")
-        cache = ensure_cache(name, src["url"])
-        sha = resolve_sha(cache, src["revision"])
+        caches[name] = ensure_cache(src, fetched)
+        sha = resolve_sha(caches[name], src["revision"])
         resolved[name] = sha
         info(f"{src['revision']}  ->  {sha}")
 
@@ -453,7 +467,8 @@ def cmd_sync(args):
     for name, src in ordered:
         materialize_source(
             name, resolved[name], src.get("sparse") or [],
-            bool(src.get("readonly", False)), source_path(src, name), state,
+            bool(src.get("readonly", False)), source_path(src, name),
+            caches[name], state,
         )
 
     ensure_git_filters(cfg)
@@ -520,7 +535,7 @@ def cmd_outdated(_args):
     cfg = load_config()
     lock = load_lock()
     for name, src in cfg["sources"].items():
-        cache = CACHE / f"{name}.git"
+        cache = CACHE / f"{cache_key(src)}.git"
         if not cache.exists():
             print(f"{name:<14} 无缓存 — 先执行 ./workspace sync")
             continue
@@ -578,7 +593,7 @@ def cmd_clean(args):
     for name, src in cfg["sources"].items():
         path = source_path(src, name)
         wt = ROOT / path
-        cache = CACHE / f"{name}.git"
+        cache = CACHE / f"{cache_key(src)}.git"
         if (wt / ".git").exists() and cache.exists():
             if is_locked(wt):
                 set_locked(wt, False)

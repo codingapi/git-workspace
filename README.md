@@ -54,9 +54,16 @@ sources:
     url: <git 地址>
     revision: <分支 | tag | SHA>        # sync 时解析为 SHA 写入 lock
     path: <工程内装配位置>               # 可嵌套(如 flow-engine/web);缺省 = 源名字
-    sparse: [<目录>...]                  # 可选,cone 模式稀疏检出
+    sparse: [<目录>...]                  # 可选,cone 模式稀疏检出(目录粒度,顶层文件恒保留)
     readonly: true                       # 可选,文件系统级只读(三方依赖推荐)
+    cache: <缓存名>                      # 可选,显式镜像缓存键;缺省按 URL 键控,同 url 自动共享
 ```
+
+**同一仓库多处装配**:相同 url 配置多条 source = 多个独立 worktree
+(各自独立的 sparse/只读/HEAD),对象自动共享同一个镜像缓存,不重复
+下载——这是 git worktree 的原生语义。同一仓库的不同 revision 也可
+这样并存。每条配置的 `path` 即装配位置,`sparse` 即检出过滤,两者
+组合 = "取指定内容,放到指定位置"。
 
 ## 使用规则
 
