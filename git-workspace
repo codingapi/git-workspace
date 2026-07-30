@@ -34,6 +34,7 @@ Commands:
     git-workspace outdated        check lock drift and newer upstream versions
     git-workspace guard           commit protection: refuse staging assembly dirs in the outer repo (called by the git hook)
     git-workspace clean           remove worktrees (--all also removes the git cache)
+    git-workspace update          self-update to the latest upstream release tag
     git-workspace version         print version and exit
 """
 
@@ -47,7 +48,9 @@ from pathlib import Path
 
 import yaml
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+UPSTREAM_URL = "https://github.com/codingapi/git-workspace.git"
 
 CONFIG_NAME = "git-workspace.yaml"
 LOCK_NAME = "git-workspace.lock.yaml"
@@ -576,6 +579,56 @@ def cmd_init(_args):
     step(f"done. next: edit {CONFIG_NAME}, then run `git-workspace sync`")
 
 
+def _ver_tuple(s: str):
+    """'v0.2.0' → (0, 2, 0) for ordering release tags; non-numeric parts stay strings."""
+    parts = []
+    for p in s.strip().lstrip("vV").split("."):
+        parts.append(int(p) if p.isdigit() else p)
+    return tuple(parts)
+
+
+def cmd_update(_args):
+    """Self-update: compare against the latest upstream release tag and replace
+    the installed script with that release. Refuses to run inside a git
+    checkout — a development copy is upgraded with `git pull` instead."""
+    script = Path(__file__).resolve()
+    if (script.parent / ".git").exists():
+        die("this git-workspace lives in a git checkout — update with `git pull` instead")
+    step(f"checking for updates ({UPSTREAM_URL})")
+    out = git(["ls-remote", "--tags", "--refs", "--sort=-v:refname", UPSTREAM_URL])
+    tags = [ln.rsplit("refs/tags/", 1)[-1] for ln in out.splitlines() if "refs/tags/" in ln]
+    if not tags:
+        raise WorkspaceError(f"no release tags found at {UPSTREAM_URL}")
+    latest = tags[0]
+    current = f"v{__version__}"
+    info(f"local: {current}   latest release: {latest}")
+    try:
+        cur_v, new_v = _ver_tuple(current), _ver_tuple(latest)
+        if cur_v == new_v:
+            step("already up to date")
+            return
+        if cur_v > new_v:
+            step(f"local {current} is newer than the latest release {latest} — nothing to do")
+            return
+    except TypeError:  # incomparable version shapes → update anyway
+        pass
+    import shutil
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="git-workspace-update-"))
+    try:
+        info(f"downloading {latest} ...")
+        git(["clone", "--depth", "1", "--quiet", "--branch", latest, UPSTREAM_URL, str(tmp)])
+        src = tmp / "git-workspace"
+        if not src.exists():
+            raise WorkspaceError(f"release {latest} does not contain the git-workspace script")
+        mode = script.stat().st_mode
+        script.write_bytes(src.read_bytes())
+        script.chmod(mode)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    step(f"updated: {current} -> {latest}")
+
+
 def cmd_sync(args):
     cfg = load_config()
     state = load_state()
@@ -791,6 +844,7 @@ EPILOG = """examples:
   git-workspace status              show per-source SHA, dirty, filter and read-only state
   git-workspace outdated            check lock drift and newer upstream tags
   git-workspace clean [--all]       remove worktrees (--all also removes the git cache)
+  git-workspace update              self-update to the latest upstream release tag
 """
 
 
@@ -817,14 +871,18 @@ def main():
     sub.add_parser("guard", help="commit-protection check (called by the git pre-commit hook)")
     p_clean = sub.add_parser("clean", help="remove worktrees")
     p_clean.add_argument("--all", action="store_true", help="also remove .workspace/git-cache")
+    sub.add_parser("update", help="self-update to the latest upstream release tag")
     sub.add_parser("version", help="print version and exit")
 
     args = parser.parse_args()
 
     try:
-        # `version` needs no workspace; `init` creates one in the CWD.
+        # `version`/`update` need no workspace; `init` creates one in the CWD.
         if args.cmd == "version":
             print(f"git-workspace {__version__}")
+            return
+        if args.cmd == "update":
+            cmd_update(args)
             return
         if args.cmd == "init":
             init_paths(Path.cwd())

@@ -2,8 +2,11 @@
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File install.ps1 [-Prefix DIR] [-Uninstall]
+#   iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/install.ps1) }"
+#   iex "& { $(irm .../install.ps1) } -Uninstall"
 #
-# Default prefix: %LOCALAPPDATA%\Programs\git-workspace
+# Standalone mode (irm|iex) installs the LATEST RELEASE TAG, not the
+# development branch. Default prefix: %LOCALAPPDATA%\Programs\git-workspace
 # Installs git-workspace.cmd and adds the directory to your user PATH.
 # For Git Bash / MSYS / Cygwin use install.sh instead.
 
@@ -38,8 +41,20 @@ if (-not (Test-Path (Join-Path $SrcDir "git-workspace"))) {
     }
     $TempDir = Join-Path $env:TEMP "git-workspace-install"
     if (Test-Path $TempDir) { Remove-Item -Recurse -Force $TempDir }
-    Write-Host "==> cloning $RepoUrl"
-    git clone --depth 1 --quiet $RepoUrl $TempDir
+    # install from the latest release tag, not the development branch
+    $refs = git ls-remote --tags --refs --sort=-v:refname $RepoUrl 2>$null
+    $tag = $null
+    if ($refs) {
+        $tag = (($refs | Select-Object -First 1) -split 'refs/tags/')[-1]
+    }
+    if ($tag) {
+        Write-Host "==> cloning $RepoUrl @ $tag (latest release)"
+        git clone --depth 1 --quiet --branch $tag $RepoUrl $TempDir
+    } else {
+        Write-Warning "no release tags found - installing from the default branch"
+        Write-Host "==> cloning $RepoUrl"
+        git clone --depth 1 --quiet $RepoUrl $TempDir
+    }
     if ($LASTEXITCODE -ne 0) { Write-Error "git clone failed" }
     $SrcDir = $TempDir
 }

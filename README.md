@@ -39,23 +39,43 @@ workspace/
 ## Install
 
 Requires: Python 3.8+, git, PyYAML (the installers check / install PyYAML for you).
+Standalone installs pin the **latest release tag** — never the development branch.
 
-**Linux / macOS / Windows Git-Bash:**
+**Linux / macOS / Windows Git-Bash — one-liner:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/codingapi/git-workspace/main/install.sh | sh
+```
+
+Uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/codingapi/git-workspace/main/install.sh | sh -s -- --uninstall
+```
+
+From a clone (same script; options: `--prefix DIR` — default `~/.local`, `--uninstall`):
 
 ```bash
 git clone git@github.com:codingapi/git-workspace.git
 cd git-workspace
-./install.sh                  # installs to ~/.local/bin (override with --prefix DIR)
-./install.sh --uninstall      # remove it
+./install.sh
 ```
 
-**Windows (native, PowerShell):**
+**Windows (native, PowerShell) — one-liner:**
 
 ```powershell
-git clone git@github.com:codingapi/git-workspace.git
-cd git-workspace
-powershell -ExecutionPolicy Bypass -File install.ps1        # adds git-workspace to your user PATH
-powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
+iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/install.ps1) }"
+# uninstall:
+iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/install.ps1) } -Uninstall"
+```
+
+From a clone: `powershell -ExecutionPolicy Bypass -File install.ps1` (adds
+`git-workspace` to your user PATH; `-Uninstall` reverses it).
+
+**Self-update** (for an installed CLI):
+
+```bash
+git-workspace update          # compares your version with the latest release tag, upgrades in place
 ```
 
 On Windows the read-only lock maps to the read-only file attribute (still
@@ -71,6 +91,7 @@ git-workspace status          # source SHAs, dirty state, checkout filters, read
 git-workspace outdated        # newer upstream tags? lock drift?
 git-workspace guard           # commit-protection check (called by the pre-commit hook)
 git-workspace clean           # tear down worktrees (--all also removes the git cache)
+git-workspace update          # self-update to the latest release tag
 git-workspace version         # print version
 ```
 

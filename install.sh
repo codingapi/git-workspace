@@ -3,8 +3,11 @@
 #
 # Usage:
 #   ./install.sh [--prefix DIR] [--uninstall]
+#   curl -fsSL https://raw.githubusercontent.com/codingapi/git-workspace/main/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --uninstall
 #
-# Default prefix: $HOME/.local  ->  installs $HOME/.local/bin/git-workspace
+# Standalone mode (curl|sh) installs the LATEST RELEASE TAG, not the
+# development branch. Default prefix: $HOME/.local  ->  $HOME/.local/bin/git-workspace
 # For native Windows (cmd/PowerShell) use install.ps1 instead.
 
 set -eu
@@ -67,8 +70,17 @@ if [ ! -f "$SRC_DIR/git-workspace" ]; then
         echo "error: git is required to clone the repository" >&2; exit 1; }
     TMP_CLONE=$(mktemp -d)
     trap 'rm -rf "$TMP_CLONE"' EXIT
-    echo "==> cloning $REPO_URL"
-    git clone --depth 1 --quiet "$REPO_URL" "$TMP_CLONE"
+    # install from the latest release tag, not the development branch
+    TAG=$(git ls-remote --tags --refs --sort=-v:refname "$REPO_URL" 2>/dev/null \
+        | head -n 1 | sed 's|.*refs/tags/||')
+    if [ -n "$TAG" ]; then
+        echo "==> cloning $REPO_URL @ $TAG (latest release)"
+        git clone --depth 1 --quiet --branch "$TAG" "$REPO_URL" "$TMP_CLONE"
+    else
+        echo "warning: no release tags found — installing from the default branch" >&2
+        echo "==> cloning $REPO_URL"
+        git clone --depth 1 --quiet "$REPO_URL" "$TMP_CLONE"
+    fi
     SRC_DIR="$TMP_CLONE"
 fi
 
@@ -88,7 +100,8 @@ fi
 mkdir -p "$PREFIX/bin"
 cp "$SRC_DIR/git-workspace" "$BIN"
 chmod +x "$BIN"
-echo "==> installed: $BIN"
+VER=$("$BIN" version 2>/dev/null || echo "unknown")
+echo "==> installed: $BIN ($VER)"
 
 case ":$PATH:" in
     *":$PREFIX/bin:"*)

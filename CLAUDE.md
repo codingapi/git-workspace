@@ -16,6 +16,7 @@ The source of **git-workspace**, a "Workspace Projection Layer" CLI: a declarati
 ./git-workspace outdated        # lock drift + upstream newer tags (fetches each cache first)
 ./git-workspace guard           # commit-protection check; invoked by the generated pre-commit hook
 ./git-workspace clean           # remove worktrees (--all also deletes .workspace/git-cache)
+./git-workspace update          # self-update the installed CLI to the latest upstream release tag
 ./git-workspace version         # print version (also -V/--version)
 ./install.sh [--prefix DIR] [--uninstall]   # install CLI to ~/.local/bin (Linux/macOS/Git-Bash); install.ps1 for native Windows
 ```
@@ -26,7 +27,11 @@ There is **no test suite**. Verify changes by running the CLI: `-h`, `version`, 
 
 ### Workspace root resolution
 
-The CLI works both in-repo (`./git-workspace`) and globally installed. `find_root()` walks **up from the CWD** until it finds `git-workspace.yaml`, then `init_paths(root)` binds the module globals (`ROOT`, `CONFIG_PATH`, `LOCK_PATH`, `DOT`, `CACHE`, `STATE_PATH`). Exceptions handled in `main()`: `version` needs no root; `init` operates on the CWD itself; `guard` is **lenient** — no config found → exit 0 (nothing to protect) rather than blocking commits.
+The CLI works both in-repo (`./git-workspace`) and globally installed. `find_root()` walks **up from the CWD** until it finds `git-workspace.yaml`, then `init_paths(root)` binds the module globals (`ROOT`, `CONFIG_PATH`, `LOCK_PATH`, `DOT`, `CACHE`, `STATE_PATH`). Exceptions handled in `main()`: `version` and `update` need no root; `init` operates on the CWD itself; `guard` is **lenient** — no config found → exit 0 (nothing to protect) rather than blocking commits.
+
+### Releases, installers, and self-update
+
+`UPSTREAM_URL` points at the canonical GitHub repo. Release flow is tag-driven: `install.sh` / `install.ps1` in standalone (curl|sh) mode resolve the latest tag via `git ls-remote --tags --refs --sort=-v:refname` and shallow-clone that (default-branch fallback + warning if no tags exist); `cmd_update` compares `_ver_tuple(f"v{__version__}")` against the latest tag and overwrites the running script file in place (preserving its mode). `update` **refuses when the script lives in a git checkout** (`.git` next to the script → use `git pull`), so it only touches installed copies. When adding features: bump `__version__`, commit, then tag `v<version>` and push the tag — installers and `update` pick it up automatically.
 
 ### The three data layers
 
