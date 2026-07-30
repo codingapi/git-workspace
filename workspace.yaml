@@ -5,13 +5,14 @@ version: 1
 
 sources:
   # path = 真实 worktree 在工程中的装配位置(IDE 打开工程根目录即可开发/构建)
+  # 装配位置同时也是 git 过滤边界:引擎自动让外层仓库与父仓库忽略它,无需手工配置
   # 升级 = 改 revision → sync → 验证 → 连 lock 一起提交(显式事件,不漂移)
   flow-engine:
     url: git@github.com:codingapi/flow-engine.git
     revision: v0.0.66
     path: flow-engine
 
-  # 嵌套装配:前端是后端工程的 web 部分;父仓库自动忽略该目录(不污染其 git status)
+  # 嵌套装配:前端是后端工程的 web 部分;父仓库自动忽略该目录
   flow-frontend:
     url: git@github.com:codingapi/flow-frontend.git
     revision: v0.0.67
@@ -24,12 +25,3 @@ sources:
     path: frameworks/fastjson2
     sparse: [core]
     readonly: true
-
-# views = symlink 只读视窗(仅供浏览;不要在里面执行构建)
-views:
-  - source: flow-frontend
-    from: apps
-    to: web2/apps
-  - source: flow-frontend
-    from: docs
-    to: web2/docs

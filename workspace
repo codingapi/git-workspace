@@ -6,28 +6,29 @@
 
 核心模型——仓库分两种角色,引擎区别对待:
 
-  1. 开发型仓库(工程的组成部分):真实 git worktree 直接放置在工程的逻辑
+  1. 开发型仓库(工程的组成部分):真实 git worktree 直接装配在工程的逻辑
      位置上(如 flow-engine/、flow-engine/web/),IDE 打开工程根目录即可
-     开发、构建、调试——真实目录,pnpm/maven/docker 均无 symlink 问题。
+     开发、构建、调试——真实目录,工作区内没有任何 symlink。
   2. 消费型依赖(只读输入):同样是真实 worktree,但配 sparse + readonly,
      文件系统级锁定,唯一写入者是本工具。
 
-  symlink 仅用于"只读视窗"(views):把某仓库的子目录另行曝光到方便浏览
-  的位置(如 web2 = apps + docs)。绝不在视图里执行构建。
+Git 过滤全自动:引擎按 yaml 声明的装配路径,在外层仓库与父级 worktree 的
+exclude 中写入"托管块"(managed block),每次 sync 重写、自我修复。不属于
+任何源装配路径的目录即本地代码,自动被外层 git 跟踪——无需任何手工
+gitignore 配置。
 
 布局:
     .workspace/git-cache/   bare/mirror 对象缓存(多 worktree 共享 objects)
     <各 source.path>        真实 Git worktree(装配位置,可嵌套)
-    <各 view.to>            symlink 只读视窗
     workspace.lock.yaml     解析后的 commit SHA 锁定快照
 
 命令:
-    workspace sync        拉取/更新全部源,物化 worktree,重建视窗,写 lock
+    workspace sync           拉取/更新全部源,物化 worktree,刷新 git 过滤,写 lock
     workspace sync --locked  严格模式:与 lock 不一致即失败(CI/团队复现)
-    workspace status      查看源与视窗状态
-    workspace outdated    检查 lock 漂移与上游新版本
-    workspace guard       提交防护:拒绝外层仓库暂存装配目录(git hook 调用)
-    workspace clean       拆除 worktree 与视窗(--all 连同 git 缓存)
+    workspace status         查看各源状态
+    workspace outdated       检查 lock 漂移与上游新版本
+    workspace guard          提交防护:拒绝外层仓库暂存装配目录(git hook 调用)
+    workspace clean          拆除 worktree(--all 连同 git 缓存)
 """
 
 import argparse
@@ -47,6 +48,8 @@ DOT = ROOT / ".workspace"
 CACHE = DOT / "git-cache"
 STATE_PATH = DOT / "state.json"
 
+BLOCK_BEGIN = "# workspace-engine managed (begin)"
+BLOCK_END = "# workspace-engine managed (end)"
 RESERVED_TOPS = {".git", ".workspace"}
 RESERVED_FILES = {
     "workspace", "workspace.yaml", "workspace.lock.yaml",
@@ -133,6 +136,41 @@ def source_path(src: dict, name: str) -> str:
     return src.get("path") or name
 
 
+def all_source_paths(cfg) -> list:
+    return sorted(
+        Path(source_path(s, n)) for n, s in cfg["sources"].items()
+    )
+
+
+def minimal_cover(paths: list) -> list:
+    """剔除被其他路径祖先覆盖的路径——祖先的忽略规则已涵盖后代。"""
+    return [
+        p for p in paths
+        if not any(o != p and o in p.parents for o in paths)
+    ]
+
+
+def write_managed_block(path: Path, lines: list):
+    """在文件中维护一个带标记的托管块:每次整体重写,自我修复、不残留。"""
+    existing = path.read_text().splitlines() if path.exists() else []
+    kept, in_block = [], False
+    for ln in existing:
+        if ln.strip() == BLOCK_BEGIN:
+            in_block = True
+            continue
+        if ln.strip() == BLOCK_END:
+            in_block = False
+            continue
+        if not in_block:
+            kept.append(ln)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    if lines:
+        kept += ["", BLOCK_BEGIN, *lines, BLOCK_END]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(("\n".join(kept) + "\n") if kept else "")
+
+
 # ---------------------------------------------------------------- config
 
 def load_config() -> dict:
@@ -185,35 +223,7 @@ def load_config() -> dict:
             if other != name and p in p2.parents:
                 die(f"source {other}: 不允许嵌套装配进只读源 {name} ({p})")
 
-    views = cfg.get("views") or cfg.get("projections") or []
-    for i, v in enumerate(views):
-        for key in ("source", "from", "to"):
-            if not v.get(key):
-                die(f"view #{i}: missing {key}")
-        if v.get("mode", "symlink") != "symlink":
-            die(f"view #{i}: unsupported mode {v['mode']!r} (only 'symlink')")
-        if v["source"] not in sources:
-            die(f"view #{i}: unknown source {v['source']!r}")
-        if ".." in Path(v["from"]).parts or ".." in Path(v["to"]).parts:
-            die(f"view #{i}: path escapes workspace")
-        top = Path(v["to"]).parts[0]
-        if top in RESERVED_TOPS:
-            die(f"view #{i}: dest inside reserved dir {top!r}")
-        # 视窗不得落在任何源 worktree 内部(那是他人的 git 工作树)
-        for sname, src in sources.items():
-            sp = Path(source_path(src, sname))
-            tp = Path(v["to"])
-            if sp == tp or sp in tp.parents or tp in sp.parents:
-                die(f"view #{i}: dest {v['to']!r} 与源 {sname} 的装配位置 {str(sp)!r} 重叠")
-    seen_to = []
-    for i, v in enumerate(views):
-        tp = Path(v["to"])
-        for prev in seen_to:
-            if tp == prev or prev in tp.parents or tp in prev.parents:
-                die(f"view #{i}: dest {v['to']!r} 与已有视窗 {str(prev)!r} 重叠")
-        seen_to.append(tp)
-
-    cfg["sources"], cfg["views"] = sources, views
+    cfg["sources"] = sources
     return cfg
 
 
@@ -253,7 +263,6 @@ def is_locked(wt: Path) -> bool:
 
 
 def _chmod_no_follow(p: Path, mode: int):
-    """chmod 但绝不跟随 symlink(避免误改其他源/全局 store 的文件)。"""
     try:
         os.chmod(p, mode, follow_symlinks=False)
     except (NotImplementedError, OSError):
@@ -350,90 +359,41 @@ def materialize_source(name, sha, sparse, readonly, path, state):
     info(f"{path}/  created @ {sha[:12]} ({label})")
 
 
-def ensure_parent_excludes(cfg):
-    """嵌套装配时,让父 worktree 的 git 忽略子目录(避免父仓库 status 噪音)。"""
-    items = sorted(
-        ((Path(source_path(s, n)), n) for n, s in cfg["sources"].items()),
-        key=lambda t: len(t[0].parts),
-    )
-    for path, name in items:
-        for ppath, pname in items:
-            if pname == name or ppath not in path.parents:
-                continue
-            parent_wt = ROOT / ppath
-            if not (parent_wt / ".git").exists():
-                continue
-            rel = str(path.relative_to(ppath)) + "/"
-            # linked worktree 的 info/exclude 位于 commondir(主仓库 gitdir),
-            # 而非 per-worktree 目录——写错位置 git 根本不读
-            common = Path(git(["rev-parse", "--git-common-dir"], cwd=parent_wt))
-            if not common.is_absolute():
-                common = parent_wt / common
-            exc = common / "info" / "exclude"
-            lines = exc.read_text().splitlines() if exc.exists() else []
-            if rel not in lines:
-                exc.parent.mkdir(parents=True, exist_ok=True)
-                with exc.open("a") as f:
-                    # 注意:gitignore 语法不支持行内注释,注释必须单独成行
-                    f.write("# workspace-engine: 嵌套装配的子仓库\n")
-                    f.write(f"{rel}\n")
-                info(f"{pname}: 已在 git exclude 中忽略嵌套的 {rel}")
+# ---------------------------------------------------------------- git 过滤(全自动)
 
+def ensure_git_filters(cfg):
+    """按装配路径精确管理 git 忽略,全部写入托管块(每次 sync 整体重写):
 
-# ---------------------------------------------------------------- views (symlinks)
+    - 外层仓库:忽略每个不被其他源覆盖的装配路径(+ .workspace)
+      → 任何不在源装配路径下的目录自动成为"本地代码",被外层 git 跟踪
+    - 嵌套装配:子路径写入父 worktree 的 exclude(linked worktree 的
+      info/exclude 位于 commondir,而非 per-worktree 目录)
+    """
+    paths = all_source_paths(cfg)
 
-def _link_one(src: Path, dest: Path, rel_dest: str, ours: set, new_links: dict):
-    """创建/校正单条视窗链接;冲突(非我方内容)拒绝覆盖。"""
-    rel_target = os.path.relpath(src, dest.parent)
-    if dest.is_symlink():
-        if os.readlink(str(dest)) == rel_target:
-            new_links[rel_dest] = rel_target
-            return
-        if rel_dest in ours:
-            dest.unlink()  # 我方旧链接 → 安全替换
-        else:
-            raise WorkspaceError(f"view {rel_dest}: 非托管 symlink 占位,拒绝覆盖")
-    elif dest.exists():
-        raise WorkspaceError(
-            f"view {rel_dest}: refuses to overwrite existing "
-            f"{'directory' if dest.is_dir() else 'file'}"
-        )
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(rel_target, str(dest))
-    new_links[rel_dest] = rel_target
+    # 外层仓库
+    if (ROOT / ".git").exists():
+        lines = ["/.workspace/"]
+        lines += [f"/{p.as_posix()}/" for p in minimal_cover(paths)]
+        write_managed_block(ROOT / ".git" / "info" / "exclude", lines)
 
+    # 父级 worktree 忽略嵌套子仓库(按父分组)
+    by_parent = {}
+    for p in paths:
+        for o in paths:
+            if o != p and p in o.parents:
+                by_parent.setdefault(p, []).append(o.relative_to(p).as_posix() + "/")
+    for parent, rels in by_parent.items():
+        wt = ROOT / parent
+        if not (wt / ".git").exists():
+            continue
+        common = Path(git(["rev-parse", "--git-common-dir"], cwd=wt))
+        if not common.is_absolute():
+            common = wt / common
+        write_managed_block(common / "info" / "exclude", sorted(rels))
 
-def build_views(views, sources, state) -> dict:
-    """创建/校正只读视窗(symlink),清理失效链接。"""
-    ours = set(state.get("links", {}))
-    new_links = {}
-    for v in views:
-        src = (ROOT / source_path(sources[v["source"]], v["source"]) / v["from"]).resolve()
-        if not src.exists():
-            raise WorkspaceError(
-                f"view {v['to']}: source path missing: {src} (sparse-checkout 可能排除了它)"
-            )
-        dest = ROOT / v["to"]
-        _link_one(src, dest, v["to"], ours, new_links)
-        info(f"{v['to']}  ->  {os.path.relpath(src, dest.parent)}")
+    info("git 过滤已按配置刷新(外层 exclude + 父级 worktree exclude)")
 
-    for old in ours - set(new_links):
-        path = ROOT / old
-        if path.is_symlink():
-            path.unlink()
-            info(f"removed stale link {old}")
-    # 回收空目录(旧视窗遗留)
-    for v in views + [{"to": o} for o in ours - set(new_links)]:
-        top = ROOT / Path(v["to"]).parts[0]
-        if top.is_dir():
-            for dirpath, _, _ in os.walk(top, topdown=False):
-                d = Path(dirpath)
-                if not any(d.iterdir()):
-                    d.rmdir()
-    return new_links
-
-
-# ---------------------------------------------------------------- git integration
 
 def ensure_hooks():
     """外层 git 仓库自动启用 pre-commit 防护(拦截三方代码误提交)。"""
@@ -448,34 +408,9 @@ def ensure_hooks():
         info("pre-commit 防护钩子已启用 (core.hooksPath=.githooks)")
 
 
-def ensure_outer_ignores(cfg):
-    """让外层仓库忽略所有装配目录与视窗(配置驱动,写入 .git/info/exclude)。"""
-    if not (ROOT / ".git").exists():
-        return
-    exc = ROOT / ".git" / "info" / "exclude"
-    lines = exc.read_text().splitlines() if exc.exists() else []
-    tops = {".workspace"}
-    for n, s in cfg["sources"].items():
-        tops.add(Path(source_path(s, n)).parts[0])
-    for v in cfg["views"]:
-        tops.add(Path(v["to"]).parts[0])
-    add = [f"/{t}/" for t in sorted(tops) if f"/{t}/" not in lines]
-    if add:
-        exc.parent.mkdir(parents=True, exist_ok=True)
-        with exc.open("a") as f:
-            if "# workspace-engine managed ignores" not in lines:
-                f.write("# workspace-engine managed ignores\n")
-            f.write("\n".join(add) + "\n")
-        info(f"外层仓库已忽略: {' '.join(add)}")
-
-
-def protected_tops(cfg) -> set:
-    tops = {".workspace"}
-    for n, s in cfg["sources"].items():
-        tops.add(Path(source_path(s, n)).parts[0])
-    for v in cfg["views"]:
-        tops.add(Path(v["to"]).parts[0])
-    return tops
+def protected_paths(cfg) -> set:
+    """受保护路径 = 全部源装配路径(精确)+ .workspace。"""
+    return {".workspace"} | {p.as_posix() for p in all_source_paths(cfg)}
 
 
 # ---------------------------------------------------------------- commands
@@ -520,10 +455,8 @@ def cmd_sync(args):
             name, resolved[name], src.get("sparse") or [],
             bool(src.get("readonly", False)), source_path(src, name), state,
         )
-    ensure_parent_excludes(cfg)
 
-    step("views")
-    new_links = build_views(cfg["views"], cfg["sources"], state)
+    ensure_git_filters(cfg)
 
     state["sources"] = {
         name: {
@@ -534,7 +467,6 @@ def cmd_sync(args):
         }
         for name, src in cfg["sources"].items()
     }
-    state["links"] = new_links
     save_state(state)
 
     lock = {
@@ -552,14 +484,12 @@ def cmd_sync(args):
         "# Generated by `workspace sync` — 锁定各源的 commit,可提交入库以保证团队复现\n"
         + yaml.safe_dump(lock, sort_keys=False, allow_unicode=True)
     )
-    ensure_outer_ignores(cfg)
     ensure_hooks()
     step(f"done. lock written: {LOCK_PATH.name}")
 
 
 def cmd_status(_args):
     cfg = load_config()
-    state = load_state()
     print("Sources:")
     for name, src in cfg["sources"].items():
         path = source_path(src, name)
@@ -582,17 +512,6 @@ def cmd_status(_args):
             f"  {dirty_state}  {ro_state}"
             f"  {'sparse: ' + ', '.join(sparse) if sparse else 'full'}"
         )
-    print("Views:")
-    for v in cfg["views"]:
-        dest = ROOT / v["to"]
-        if dest.is_symlink():
-            tgt = os.readlink(str(dest))
-            ok = dest.resolve().exists()
-            print(f"  {v['to']:<24} -> {tgt}  {'ok' if ok else 'BROKEN'}")
-        elif dest.exists():
-            print(f"  {v['to']:<24} CONFLICT (real path exists, not a link)")
-        else:
-            print(f"  {v['to']:<24} missing (run `workspace sync`)")
     print(f"Lock: {LOCK_PATH.name} {'present' if LOCK_PATH.exists() else 'absent'}")
 
 
@@ -625,11 +544,14 @@ def cmd_outdated(_args):
 
 
 def cmd_guard(_args):
-    """提交防护(git pre-commit 钩子调用):拒绝将装配目录/视窗提交进外层仓库。"""
+    """提交防护(git pre-commit 钩子调用):拒绝将装配目录提交进外层仓库。"""
     cfg = load_config()
-    tops = protected_tops(cfg)
+    protected = protected_paths(cfg)
     staged = git(["diff", "--cached", "--name-only"], cwd=ROOT).splitlines()
-    bad = [f for f in staged if any(f == t or f.startswith(t + "/") for t in tops)]
+    bad = sorted({
+        f for f in staged
+        if any(f == p or f.startswith(p + "/") for p in protected)
+    })
     gitlinks = []
     for line in git(["diff", "--cached", "--raw"], cwd=ROOT).splitlines():
         parts = line.split()
@@ -637,11 +559,11 @@ def cmd_guard(_args):
             gitlinks.append(line.split("\t", 1)[-1])
     if bad or gitlinks:
         print("✋ workspace guard 拒绝提交:", file=sys.stderr)
-        for f in bad + gitlinks:
+        for f in sorted(set(bad) | set(gitlinks)):
             print(f"     {f}", file=sys.stderr)
         print(
             "\n   规则:\n"
-            "   - 装配目录(各源 worktree)与视窗 → 用各自的 git 提交(上游走 PR)\n"
+            "   - 装配目录(各源 worktree)→ 用各自的 git 提交(上游走 PR)\n"
             "   - 外层仓库 → 只提交 workspace.yaml/lock、文档、工具与本地代码目录\n"
             "   - 误操作 → git reset 移出暂存区后重试",
             file=sys.stderr,
@@ -652,13 +574,6 @@ def cmd_guard(_args):
 
 def cmd_clean(args):
     cfg = load_config()
-    state = load_state()
-
-    for link in state.get("links", {}):
-        path = ROOT / link
-        if path.is_symlink():
-            path.unlink()
-            info(f"removed link {link}")
 
     for name, src in cfg["sources"].items():
         path = source_path(src, name)
@@ -675,12 +590,9 @@ def cmd_clean(args):
                 git(["worktree", "prune"], cwd=cache)
             info(f"removed worktree {path}/")
 
-    # 回收空目录
-    for d in sorted(
-        {ROOT / Path(source_path(s, n)).parts[0] for n, s in cfg["sources"].items()}
-        | {ROOT / Path(v["to"]).parts[0] for v in cfg["views"]},
-        key=lambda p: -len(p.parts),
-    ):
+    # 回收空目录(自底向上)
+    for d in sorted(all_source_paths(cfg), key=lambda p: -len(p.parts)):
+        d = ROOT / d
         while d != ROOT and d.is_dir() and not any(d.iterdir()):
             d.rmdir()
             d = d.parent
@@ -700,16 +612,16 @@ def cmd_clean(args):
 def main():
     parser = argparse.ArgumentParser(prog="workspace", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p_sync = sub.add_parser("sync", help="拉取/更新源,物化 worktree,重建视窗")
+    p_sync = sub.add_parser("sync", help="拉取/更新源,物化 worktree,刷新 git 过滤")
     p_sync.add_argument(
         "--locked",
         action="store_true",
         help="严格模式:解析结果必须与 workspace.lock.yaml 一致,否则失败(CI/复现用)",
     )
-    sub.add_parser("status", help="查看源与视窗状态")
+    sub.add_parser("status", help="查看各源状态")
     sub.add_parser("outdated", help="检查各源相对 lock 的漂移与上游新版本")
     sub.add_parser("guard", help="提交防护检查(由 git pre-commit 钩子调用)")
-    p_clean = sub.add_parser("clean", help="删除 worktree 与视窗")
+    p_clean = sub.add_parser("clean", help="删除 worktree")
     p_clean.add_argument("--all", action="store_true", help="连同 .workspace/git-cache 一起删除")
 
     args = parser.parse_args()
