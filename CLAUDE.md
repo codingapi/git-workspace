@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-The source of **git-workspace**, a "Workspace Projection Layer" CLI: a declarative `git-workspace.yaml` assembles **real git worktrees** into a complete project tree. The entire engine is the single-file `./git-workspace` script (~800 lines of Python 3, depends only on PyYAML and the git CLI). This repo is the *software*, not an active workspace — `example.yaml` / `example.lock.yaml` are bundled sample data (to try them: `cp example.yaml git-workspace.yaml && ./git-workspace sync`; the assembled worktrees are gitignored artifacts).
+The source of **git-workspace**, a "Workspace Projection Layer" CLI: a declarative `git-workspace.yaml` assembles **real git worktrees** into a complete project tree. The entire engine is the single-file `./git-workspace` script (~900 lines of Python 3.8+, depends only on PyYAML and the git CLI). This repo is the *software*, not an active workspace — `example.yaml` / `example.lock.yaml` are bundled sample data (to try them: `cp example.yaml git-workspace.yaml && ./git-workspace sync`; the assembled worktrees are gitignored artifacts).
+
+**Design constraints** (from the contributing guidelines, don't violate):
+- Keep the single-file design — no build step, stdlib + PyYAML only; all heavy lifting delegates to native git.
+- Keep it declarative — new capabilities belong in `git-workspace.yaml`, not in CLI flags.
 
 ## Commands
 
@@ -21,7 +25,14 @@ The source of **git-workspace**, a "Workspace Projection Layer" CLI: a declarati
 ./install.sh [--prefix DIR] [--uninstall]   # install CLI to ~/.local/bin (Linux/macOS/Git-Bash); install.ps1 for native Windows
 ```
 
-There is **no test suite**. Verify changes by running the CLI: `-h`, `version`, `init` in a scratch dir, and a `sync`/`status`/`clean` round-trip against `example.yaml` (network access to GitHub required).
+There is **no test suite**. Verify changes by running the CLI: `-h`, `version`, `init` in a scratch dir, and the end-to-end smoke test against the bundled example (network access to GitHub required):
+
+```bash
+cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace status
+./git-workspace clean --all && rm git-workspace.yaml git-workspace.lock.yaml   # teardown
+```
+
+The `Makefile` wraps the same commands (`make setup` / `make sync` / `make locked` / `make status` / `make clean-all` / `make install`) for use inside an actual workspace.
 
 ## Architecture
 
