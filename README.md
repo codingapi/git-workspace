@@ -1,213 +1,166 @@
-# git-workspace — Workspace Projection Layer
+# git-workspace
 
-A layer between Git and your build system: one declarative `git-workspace.yaml`
-automatically assembles a **real project tree**.
+**English** | [中文](README.zh-CN.md)
 
-## Core model: repositories come in two roles
+git-workspace is a multi-repository workspace manager for git. You declare all
+your repositories in one YAML file, and one command assembles them into a real
+project tree — built from real git worktrees, no symlinks. Open the root in
+your IDE and develop, build, and debug as usual.
 
-- **Development repos** (flow-engine, flow-frontend) — parts of your product.
-  Real git worktrees assembled directly at their logical project locations.
-  **Open the workspace root in your IDE; develop, build and debug all happen
-  in real directories** — no symlink problems for pnpm/maven/docker;
-- **Consumed dependencies** (fastjson2) — read-only inputs. Real worktrees +
-  checkout filters (include/exclude) + a filesystem-level read-only lock; the
-  only writer is the sync tool.
+## Features
 
-There are **no symlinks anywhere** in the workspace — the assembled tree is
-all real directories. IDE, pnpm, maven and docker all work on real paths,
-with no split between logical paths and realpath.
+- 📄 **One declarative config** — `git-workspace.yaml` describes every repo: URL, revision, where to place it
+- 🌲 **A real directory tree** — assembled from git worktrees; IDE, pnpm, maven, and docker all see real paths
+- 🔍 **Sparse checkouts** — `include`/`exclude` filters fetch only what you need
+- 🔒 **Read-only dependencies** — third-party code is locked on disk; only `sync` can write it
+- 📌 **Reproducible** — a lock file pins exact commit SHAs; `sync --locked` reproduces them exactly (CI-friendly)
+- 🛡 **Commit protection** — a pre-commit hook stops third-party code leaking into your repo by accident
+- 🚀 **Self-updating** — `git-workspace update` upgrades the CLI to the latest release
 
-```
-git-workspace.yaml ──▶ projection engine ──▶ real worktrees (assembly locations)
-                            │
-             fetch / lock / filter / worktree / guard / git filters
-```
+## How to use
 
-## Directory layout
+### Install
 
-```
-workspace/
-├── flow-engine/            ← real worktree: backend (run mvn here)
-│   └── web/                ← real worktree: frontend, nested assembly (run pnpm here)
-├── frameworks/fastjson2-*  ← real worktrees: include filter + read-only lock (same repo, two places)
-├── app/ deploy/ tests/     ← your own local code (example names; tracked by the outer git automatically)
-├── .workspace/git-cache/   ← bare/mirror object caches (worktrees share objects)
-├── git-workspace.yaml      ← declarative config (checked in)
-└── git-workspace.lock.yaml ← commit SHA lock snapshot (checked in → exact team reproduction)
-```
+Requires Python 3.8+, git, and PyYAML (the installers check/install PyYAML for you).
+Standalone installs always pin the **latest release tag**, never the development branch.
 
-## Install
-
-Requires: Python 3.8+, git, PyYAML (the installers check / install PyYAML for you).
-Standalone installs pin the **latest release tag** — never the development branch.
-
-**Linux / macOS / Windows Git-Bash — one-liner:**
+**Linux / macOS / Git Bash:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/codingapi/git-workspace/main/install.sh | sh
 ```
 
-Uninstall:
+**Windows (PowerShell):**
+
+```powershell
+iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/install.ps1) }"
+```
+
+From a clone: `./install.sh` (`--prefix DIR` overrides the default `~/.local`).
+
+### Set up a workspace
+
+```bash
+mkdir my-project && cd my-project && git init
+git-workspace init          # creates git-workspace.yaml + commit-protection hooks
+# edit git-workspace.yaml and declare your repositories
+git-workspace sync          # fetches everything and assembles the tree
+```
+
+A minimal configuration:
+
+```yaml
+version: 1
+sources:
+  my-backend:
+    url: git@github.com:example/my-backend.git
+    revision: main
+    path: my-backend                 # assembly location (may nest, e.g. my-backend/web)
+  my-lib:
+    url: git@github.com:example/my-lib.git
+    revision: v1.0.0
+    path: libs/my-lib
+    include: [core]                  # check out only core/
+    readonly: true                   # lock it on disk
+```
+
+Then work directly inside the assembled tree. Any directory you haven't
+declared (e.g. `app/`) is tracked by your outer git repo as usual — no manual
+`.gitignore` configuration needed.
+
+This repository ships a runnable demo: `cp example.yaml git-workspace.yaml &&
+git-workspace sync` assembles a backend repo, a nested frontend repo, and two
+filtered read-only checkouts of the same third-party library.
+
+## Uninstall
+
+**Linux / macOS / Git Bash:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/codingapi/git-workspace/main/install.sh | sh -s -- --uninstall
 ```
 
-From a clone (same script; options: `--prefix DIR` — default `~/.local`, `--uninstall`):
-
-```bash
-git clone git@github.com:codingapi/git-workspace.git
-cd git-workspace
-./install.sh
-```
-
-**Windows (native, PowerShell) — one-liner:**
+**Windows (PowerShell):**
 
 ```powershell
-iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/install.ps1) }"
-# uninstall:
 iex "& { $(irm https://raw.githubusercontent.com/codingapi/git-workspace/main/install.ps1) } -Uninstall"
 ```
 
-From a clone: `powershell -ExecutionPolicy Bypass -File install.ps1` (adds
-`git-workspace` to your user PATH; `-Uninstall` reverses it).
+Installed from a clone? Re-run `./install.sh --uninstall`.
+To also remove a workspace's worktrees and caches first: `git-workspace clean --all`.
 
-**Self-update** (for an installed CLI):
+## Common commands
+
+| Command | Description |
+|---|---|
+| `git-workspace init` | Create a starter config + commit-protection hooks in the current directory |
+| `git-workspace sync` | Fetch sources, materialize worktrees, refresh the lock |
+| `git-workspace sync --locked` | Fail on any mismatch with the lock (CI / exact reproduction) |
+| `git-workspace status` | Per-source SHA, dirty state, checkout filters, read-only state |
+| `git-workspace outdated` | Check lock drift and newer upstream tags |
+| `git-workspace update` | Self-update to the latest release |
+| `git-workspace clean [--all]` | Remove worktrees (`--all` also clears the object caches) |
+| `git-workspace version` | Print the version (also `-V` / `--version`) |
+
+`git-workspace guard` runs inside the pre-commit hook; you rarely call it
+yourself. A `Makefile` wraps the common commands (`make sync`, `make status`,
+`make install`, …).
+
+## Core components & how it works
+
+```
+git-workspace.yaml ──▶ engine ──▶ .workspace/git-cache/      (mirror clones, shared per URL)
+                          │                 │
+                          ▼                 ▼
+             git-workspace.lock.yaml   real worktree at each source path
+                          +        managed git filters & pre-commit hook
+```
+
+- **The engine** — `git-workspace` itself: a single-file Python CLI (~850
+  lines) that depends only on git and PyYAML. It parses the config, orders the
+  work, and delegates every heavy operation to native git (mirror clone,
+  worktree, sparse-checkout, revision resolution).
+- **Two repo roles** — development repos are checked out in full and stay
+  editable where your product lives; consumed dependencies get checkout
+  filters plus a filesystem-level read-only lock, and the tool is their only
+  writer.
+- **Mirror cache** — bare clones under `.workspace/git-cache/`, keyed by URL,
+  so multiple sources from the same repository share one object store and are
+  never downloaded twice.
+- **Lock file** — `sync` resolves each revision to a SHA and writes
+  `git-workspace.lock.yaml`. Commit it, and anyone (or CI) reproduces the
+  exact tree with `sync --locked`.
+- **Workspace root discovery** — the CLI walks up from the current directory
+  to find `git-workspace.yaml`, so it behaves identically whether installed
+  globally or run from a clone.
+- **Managed git filters** — every sync rewrites marked blocks in the repos'
+  exclude files (self-healing): assembly paths are ignored by the outer repo,
+  and everything undeclared is tracked as usual.
+- **Safety** — sync refuses to overwrite uncommitted work or local commits;
+  the `guard` hook blocks force-adding assembly directories or embedded git
+  repositories into the outer repo.
+- **Release channel** — installers pin the latest release tag, and
+  `git-workspace update` compares your version against it and upgrades in
+  place.
+
+## Contributing
+
+Development needs nothing but Python 3, PyYAML, and git — run the CLI straight
+from the clone:
 
 ```bash
-git-workspace update          # compares your version with the latest release tag, upgrades in place
+git clone git@github.com:codingapi/git-workspace.git && cd git-workspace
+./git-workspace -h
+# end-to-end smoke test against the bundled example:
+cp example.yaml git-workspace.yaml && ./git-workspace sync && ./git-workspace status
+./git-workspace clean --all && rm git-workspace.yaml git-workspace.lock.yaml
 ```
 
-On Windows the read-only lock maps to the read-only file attribute (still
-effective — Python's `os.access(W_OK)` honors it).
+Guidelines:
 
-## Commands
+- Keep the single-file design — the entire engine is `git-workspace`; no build step, stdlib + PyYAML only.
+- Keep it declarative — new capabilities belong in `git-workspace.yaml`, not in flags.
+- There is no test suite yet — verify changes with the smoke test above and `git-workspace -h`.
+- Releases: bump `__version__` → commit → `git tag v<version>` → push the tag; installers and `update` pick it up automatically.
 
-```bash
-git-workspace init            # scaffold a starter git-workspace.yaml + commit-protection hooks
-git-workspace sync            # or: make setup / make sync
-git-workspace sync --locked   # strict mode: fail on any mismatch with the lock (CI / team reproduction)
-git-workspace status          # source SHAs, dirty state, checkout filters, read-only state
-git-workspace outdated        # newer upstream tags? lock drift?
-git-workspace guard           # commit-protection check (called by the pre-commit hook)
-git-workspace clean           # tear down worktrees (--all also removes the git cache)
-git-workspace update          # self-update to the latest release tag
-git-workspace version         # print version
-```
-
-## Trying the example
-
-This repo ships `example.yaml` (plus `example.lock.yaml`, a sample of the
-generated lock). To see the engine assemble a real multi-repo tree:
-
-```bash
-cp example.yaml git-workspace.yaml
-git-workspace sync
-git-workspace status
-git-workspace clean --all     # tear it all down again
-```
-
-## git-workspace.yaml syntax
-
-```yaml
-version: 1
-
-sources:
-  <name>:
-    url: <git url>
-    revision: <branch | tag | SHA>     # resolved to a SHA in the lock on sync
-    path: <assembly location>          # may nest (e.g. flow-engine/web); default = source name
-    include: [<dir>...]                # optional whitelist: check out only these dirs (cone mode, git-recommended; top-level files always kept)
-    exclude: [<path>...]               # optional blacklist: check out everything else (non-cone mode, supports nested paths like a/b/c)
-    # include and exclude are mutually exclusive; neither = full checkout
-    readonly: true                     # optional, filesystem-level read-only (recommended for third-party deps)
-    cache: <cache name>                # optional explicit mirror cache key; defaults to keying by URL, same url shares automatically
-```
-
-**Same repo assembled in multiple places**: several source entries with the
-same url = multiple independent worktrees (each with its own
-filter/read-only/HEAD); objects automatically share one mirror cache — no
-duplicate downloads. This is native git worktree semantics. Different
-revisions of the same repo can coexist this way too. Each entry's `path` is
-the assembly location and `include`/`exclude` the checkout filter; the
-combination = "take this content, put it there".
-
-**Two boundaries of filtering**:
-- `include` (cone) is directory-granular; `exclude` (non-cone) supports
-  nested paths and is backed by gitignore-style negation patterns — slightly
-  slower than cone, and git officially notes its behavior may evolve. Prefer
-  include; use exclude for "everything except a few dirs" cases;
-- pruning **never deletes directories containing untracked files** (e.g. an
-  installed node_modules) — that's git's data protection; tracked content is
-  pruned as usual. If non-filtered paths reappear after a merge/rebase,
-  `git-workspace sync` re-applies the filters automatically.
-
-## Usage rules
-
-1. **Develop directly in the assembled tree** — it's all real directories:
-   open the root in your IDE, `mvn` → `flow-engine/`, `pnpm` →
-   `flow-engine/web/`; docker builds use the workspace root as context and
-   COPY points at real paths like `flow-engine/...`.
-2. **Git filtering is fully automatic — configure no ignores yourself**: from
-   the assembly paths in the yaml, the engine writes "managed blocks" (marked,
-   rewritten wholesale on every sync, self-healing) into the outer repo's and
-   parent worktrees' exclude files. **Any directory that is not an assembly
-   path is local code, tracked by the outer git automatically** — create
-   `app/` and commit it right away; an assembly path nested deep inside local
-   dirs (e.g. `app/vendor/lib`) is still ignored precisely. Nested assembly
-   (e.g. `flow-engine/web`) is ignored via the parent repo's managed block,
-   without polluting the parent's status.
-3. **Put local code in plain directories at the workspace root** (e.g.
-   `app/`, `deploy/`, `tests/`) — edit, commit and build normally. Don't put
-   it inside assembly directories — those are other repos' git worktrees.
-4. **Check the lock in**: commit `git-workspace.lock.yaml`; teammates
-   `git clone` + `git-workspace sync --locked` reproduce exactly. Upgrade =
-   change revision → sync → verify → commit config and lock together (an
-   explicit event, no drift).
-5. **Nested assembly**: `path` may sit inside another source (e.g.
-   `flow-engine/web`); the engine handles parent-repo ignores automatically.
-   Nesting inside a read-only source is forbidden.
-
-## Read-only and commit protection
-
-- **Read-only locking**: sources with `readonly: true` are chmod-locked after
-  sync — edits/creates/deletes all fail with `Permission denied`; even
-  `rm -rf` can't delete them. Teardown goes through `git-workspace clean`
-  (auto-unlocks). The only writer is `git-workspace sync` itself (unlock on
-  sync, relock when done — the Nix store idea). Send third-party changes
-  upstream via PR.
-- **Sync safety gate**: if a source has uncommitted changes or local commits
-  since its last sync point, sync refuses to overwrite and tells you where to
-  sort it out.
-- **Commit protection**: `.githooks/pre-commit` → `git-workspace guard`,
-  computing protected paths dynamically from git-workspace.yaml (all assembly
-  paths, exact match); blocks `git add -f` force-adds and embedded git repos
-  (gitlinks). `git-workspace sync` sets `core.hooksPath` automatically, so
-  every clone is protected out of the box.
-- **Outer repo scope**: config, lock, docs, tooling, local code directories —
-  the workspace's "definition, documentation and in-house parts", never any
-  third-party source.
-
-## Version management: a three-layer model
-
-| Layer | What it manages | Managed by | How to upgrade |
-|---|---|---|---|
-| **Source versions** | which snapshot of each dependency repo | `revision` (readable tag) in git-workspace.yaml + exact SHAs in `git-workspace.lock.yaml` | explicit bump commit |
-| **Product version** | the aggregate's overall version number | the outer repo's own git tags | release = tag (the lock at tag time = the full BOM) |
-| **Ecosystem-internal versions** | version numbers inside each source's pom/package.json | each ecosystem's tools | follows the source snapshot bump automatically — never touch by hand |
-
-Release semantics: the lock at outer tag v1.0.0 pins every source SHA →
-`git checkout v1.0.0 && git-workspace sync --locked` reproduces the exact
-source combination, then `mvn package` / `pnpm build` yields the artifacts.
-Number maintenance: backend uses maven `${revision}` (CI-friendly versions),
-frontend uses `pnpm -r` coordinated bumps.
-
-## Relationship with git
-
-Git is natively a single-repo tool; multi-repo aggregation is outside its
-scope. In this scheme all the "heavy lifting" (mirror, worktree,
-sparse-checkout, rev-parse) is native git capability — the engine (~800 lines
-of Python) does just three things: parse declarations, schedule the loop,
-execute policy. The engine depends only on git's stable CLI surface; the real
-assets are the declarative yaml and the lock — platform-independent,
-reproducible by any language or tool.
+Issues and pull requests: https://github.com/codingapi/git-workspace
