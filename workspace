@@ -136,6 +136,41 @@ def source_path(src: dict, name: str) -> str:
     return src.get("path") or name
 
 
+def source_filter(src_or_state: dict) -> dict:
+    """检出过滤规格(互斥):{'include': [...]} / {'exclude': [...]} / {}。
+
+    include → git cone 模式(白名单,git 推荐,快);
+    exclude → git non-cone 模式(黑名单,gitignore 式取反,支持嵌套路径)。
+    """
+    if src_or_state.get("include"):
+        return {"include": sorted(src_or_state["include"])}
+    if src_or_state.get("exclude"):
+        return {"exclude": sorted(src_or_state["exclude"])}
+    return {}
+
+
+def apply_filter(wt: Path, filt: dict):
+    if filt.get("include"):
+        git(["sparse-checkout", "set", *filt["include"]], cwd=wt)   # cone
+    elif filt.get("exclude"):
+        # non-cone:先全包含(/*),再按 gitignore 语义取反剪枝(! 前缀)
+        git(
+            ["sparse-checkout", "set", "--no-cone", "/*",
+             *[f"!/{p}" for p in filt["exclude"]]],
+            cwd=wt,
+        )
+    else:
+        git(["sparse-checkout", "disable"], cwd=wt)
+
+
+def filter_label(filt: dict) -> str:
+    if filt.get("include"):
+        return "include: " + ", ".join(filt["include"])
+    if filt.get("exclude"):
+        return "exclude: " + ", ".join(filt["exclude"])
+    return "full"
+
+
 def cache_key(src: dict) -> str:
     """镜像缓存键:默认按 URL(同一仓库的多条配置自动共享一个对象库),
     可用 cache: 属性显式覆盖(如 URL 经常切换时固定缓存名)。"""
@@ -204,9 +239,16 @@ def load_config() -> dict:
             die(f"source {name}: readonly must be boolean")
         if src.get("cache") and not NAME_RE.match(src["cache"]):
             die(f"source {name}: invalid cache key {src['cache']!r}")
-        for p in src.get("sparse") or []:
-            if ".." in Path(p).parts:
-                die(f"source {name}: sparse path escapes: {p}")
+        # 检出过滤:include(白名单)/ exclude(黑名单),互斥
+        if src.get("include") and src.get("exclude"):
+            die(f"source {name}: include 与 exclude 互斥,只能选其一")
+        for key in ("include", "exclude"):
+            val = src.get(key) or []
+            if not isinstance(val, list) or not all(isinstance(p, str) for p in val):
+                die(f"source {name}: {key} must be a list of path strings")
+            for p in val:
+                if ".." in Path(p).parts:
+                    die(f"source {name}: {key} path escapes: {p}")
         # 装配位置校验
         path = source_path(src, name)
         parts = Path(path).parts
@@ -310,17 +352,17 @@ def set_locked(wt: Path, on: bool):
 
 # ---------------------------------------------------------------- worktrees
 
-def materialize_source(name, sha, sparse, readonly, path, cache, state):
-    """在工程装配位置创建/更新真实 worktree;按需 sparse;readonly 源同步后上锁。"""
+def materialize_source(name, sha, filt, readonly, path, cache, state):
+    """在工程装配位置创建/更新真实 worktree;按需过滤检出;readonly 源同步后上锁。"""
     wt = ROOT / path
     prev = state.get("sources", {}).get(name, {})
-    label = f"sparse: {', '.join(sparse)}" if sparse else "full"
+    label = filter_label(filt)
     if readonly:
         label += ", read-only"
 
     if (wt / ".git").exists():
         head = worktree_head(wt)
-        sparse_changed = sorted(prev.get("sparse", [])) != sorted(sparse)
+        filter_changed = source_filter(prev) != filt
         empty = not any(e.name != ".git" for e in wt.iterdir())
 
         # 安全闸:基准是"上次同步点"而非目标 SHA——在 tag/分支间切换时,
@@ -340,15 +382,12 @@ def materialize_source(name, sha, sparse, readonly, path, cache, state):
                         f"sync 拒绝覆盖。请先在 {path} 内推送/处理,再执行 sync"
                     )
 
-        changed = sparse_changed or (head != sha) or empty
+        changed = filter_changed or (head != sha) or empty
         if is_locked(wt):
             set_locked(wt, False)
         try:
-            if sparse_changed:
-                if sparse:
-                    git(["sparse-checkout", "set", *sparse], cwd=wt)
-                else:
-                    git(["sparse-checkout", "disable"], cwd=wt)
+            if filter_changed:
+                apply_filter(wt, filt)
             if head != sha:
                 git(["checkout", "--quiet", "--detach", sha], cwd=wt)
             if empty:  # 防御:no-checkout 后未物化的空 worktree
@@ -360,10 +399,10 @@ def materialize_source(name, sha, sparse, readonly, path, cache, state):
         return
 
     (ROOT / path).parent.mkdir(parents=True, exist_ok=True)
-    if sparse:
+    if filt:
         git(["worktree", "add", "--detach", "--no-checkout", "--quiet", str(wt), sha], cwd=cache)
-        git(["sparse-checkout", "set", *sparse], cwd=wt)
-        # --no-checkout 的 index 为空,sparse-checkout set 无条目可应用,需物化一次
+        apply_filter(wt, filt)
+        # --no-checkout 的 index 为空,过滤设置无条目可应用,需物化一次
         git(["read-tree", "-mu", "HEAD"], cwd=wt)
     else:
         git(["worktree", "add", "--detach", "--quiet", str(wt), sha], cwd=cache)
@@ -466,7 +505,7 @@ def cmd_sync(args):
     )
     for name, src in ordered:
         materialize_source(
-            name, resolved[name], src.get("sparse") or [],
+            name, resolved[name], source_filter(src),
             bool(src.get("readonly", False)), source_path(src, name),
             caches[name], state,
         )
@@ -476,7 +515,8 @@ def cmd_sync(args):
     state["sources"] = {
         name: {
             "sha": resolved[name],
-            "sparse": src.get("sparse") or [],
+            "include": src.get("include") or [],
+            "exclude": src.get("exclude") or [],
             "readonly": bool(src.get("readonly", False)),
             "path": source_path(src, name),
         }
@@ -514,7 +554,6 @@ def cmd_status(_args):
             continue
         head = worktree_head(wt) or "?"
         dirty = git(["status", "--porcelain"], cwd=wt)
-        sparse = src.get("sparse") or []
         ro_cfg = bool(src.get("readonly", False))
         ro_state = "read-only" if ro_cfg else "writable"
         if ro_cfg and not is_locked(wt):
@@ -524,8 +563,7 @@ def cmd_status(_args):
             dirty_state = "DIRTY(只读源出现改动?!)"
         print(
             f"  {name:<14} {path}/  {head[:12]}  rev={src['revision']}"
-            f"  {dirty_state}  {ro_state}"
-            f"  {'sparse: ' + ', '.join(sparse) if sparse else 'full'}"
+            f"  {dirty_state}  {ro_state}  {filter_label(source_filter(src))}"
         )
     print(f"Lock: {LOCK_PATH.name} {'present' if LOCK_PATH.exists() else 'absent'}")
 

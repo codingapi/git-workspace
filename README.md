@@ -8,8 +8,8 @@
 - **开发型仓库**(flow-engine、flow-frontend)——工程的组成部分。真实 git
   worktree 直接装配在工程的逻辑位置上。**IDE 打开工作区根目录,开发、构建、
   调试都在真实目录里发生**,pnpm/maven/docker 无 symlink 问题;
-- **消费型依赖**(fastjson2)——只读输入。真实 worktree + sparse 稀疏检出
-  + 文件系统级只读锁,唯一写入者是同步工具。
+- **消费型依赖**(fastjson2)——只读输入。真实 worktree + 检出过滤
+  (include/exclude)+ 文件系统级只读锁,唯一写入者是同步工具。
 
 工作区内**没有任何 symlink**——装配树全是真实目录,IDE、pnpm、maven、
 docker 均以真实路径工作,不存在逻辑路径与 realpath 的分裂。
@@ -17,7 +17,7 @@ docker 均以真实路径工作,不存在逻辑路径与 realpath 的分裂。
 ```
 workspace.yaml ──▶ 投影引擎 ──▶ 真实 worktree(装配位置)
                      │
-        fetch / lock / sparse / worktree / guard / git 过滤
+        fetch / lock / filter / worktree / guard / git 过滤
 ```
 
 ## 目录结构
@@ -26,7 +26,7 @@ workspace.yaml ──▶ 投影引擎 ──▶ 真实 worktree(装配位置)
 workspace/
 ├── flow-engine/            ← 真实 worktree:后端(mvn 在这里执行)
 │   └── web/                ← 真实 worktree:前端,嵌套装配(pnpm 在这里执行)
-├── frameworks/fastjson2/   ← 真实 worktree:sparse core + 只读锁定
+├── frameworks/fastjson2-*  ← 真实 worktree:include 过滤 + 只读锁定(同仓两处)
 ├── app/ deploy/ tests/     ← 本地自己的代码(示例名;外层 git 自动跟踪)
 ├── .workspace/git-cache/   ← bare/mirror 对象缓存(worktree 共享 objects)
 ├── workspace.yaml          ← 声明式配置(入库)
@@ -38,7 +38,7 @@ workspace/
 ```bash
 ./workspace sync            # 或 make setup / make sync
 ./workspace sync --locked   # 严格模式:与 lock 不一致即失败(CI/团队复现)
-./workspace status          # 源 SHA、dirty、sparse、只读状态
+./workspace status          # 源 SHA、dirty、检出过滤、只读状态
 ./workspace outdated        # 上游有无新 tag、lock 是否漂移
 ./workspace guard           # 提交防护检查(由 pre-commit 钩子调用)
 ./workspace clean           # 拆除 worktree(--all 连同 git 缓存)
@@ -54,16 +54,26 @@ sources:
     url: <git 地址>
     revision: <分支 | tag | SHA>        # sync 时解析为 SHA 写入 lock
     path: <工程内装配位置>               # 可嵌套(如 flow-engine/web);缺省 = 源名字
-    sparse: [<目录>...]                  # 可选,cone 模式稀疏检出(目录粒度,顶层文件恒保留)
+    include: [<目录>...]                 # 可选白名单:只检出这些目录(cone 模式,git 推荐;顶层文件恒保留)
+    exclude: [<路径>...]                 # 可选黑名单:检出其余全部(non-cone 模式,支持嵌套路径如 a/b/c)
+    # include 与 exclude 互斥;都不写 = 全量检出
     readonly: true                       # 可选,文件系统级只读(三方依赖推荐)
     cache: <缓存名>                      # 可选,显式镜像缓存键;缺省按 URL 键控,同 url 自动共享
 ```
 
 **同一仓库多处装配**:相同 url 配置多条 source = 多个独立 worktree
-(各自独立的 sparse/只读/HEAD),对象自动共享同一个镜像缓存,不重复
+(各自独立的过滤/只读/HEAD),对象自动共享同一个镜像缓存,不重复
 下载——这是 git worktree 的原生语义。同一仓库的不同 revision 也可
-这样并存。每条配置的 `path` 即装配位置,`sparse` 即检出过滤,两者
-组合 = "取指定内容,放到指定位置"。
+这样并存。每条配置的 `path` 即装配位置,`include`/`exclude` 即检出
+过滤,组合 = "取指定内容,放到指定位置"。
+
+**过滤的两个边界**:
+- `include`(cone)是目录粒度;`exclude`(non-cone)支持嵌套路径,底层
+  是 gitignore 式取反模式,性能略低于 cone,git 官方亦提示其行为可能
+  演进——优先用 include,exclude 用于"除了少数目录之外的全部"场景;
+- 剪枝**不会删除含未跟踪文件的目录**(如已安装的 node_modules)——这是
+  git 的数据保护,受跟踪内容照常剪除;merge/rebase 后若重新出现非过滤
+  路径,`./workspace sync` 会自动重新应用。
 
 ## 使用规则
 

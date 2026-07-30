@@ -5,7 +5,7 @@ version: 1
 
 sources:
   # ── 开发型仓库:全量检出,装配在工程位置 ──────────────────────────
-  # path = 装配位置(可嵌套);不写 sparse 即全量检出
+  # path = 装配位置(可嵌套);不写过滤属性即全量检出
   flow-engine:
     url: git@github.com:codingapi/flow-engine.git
     revision: v0.0.66
@@ -16,24 +16,25 @@ sources:
     revision: v0.0.67
     path: flow-engine/web          # 嵌套装配:父仓库自动忽略该目录
 
-  # ── 能力①:检出过滤(sparse)+ 指定位置(path)─────────────────
-  # sparse = 检出哪些目录(cone 模式,目录粒度;顶层文件恒保留)
-  # path   = 装配到哪里。两者组合 = "取指定内容,放到指定位置"
+  # ── 检出过滤(二选一,互斥)+ 指定位置(path)─────────────────────
+  # include: 白名单 —— 只检出列出的目录(git cone 模式,快,git 推荐;顶层文件恒保留)
+  # exclude: 黑名单 —— 检出"其余全部"(git non-cone 模式,支持嵌套路径如 a/b/c)
+  # path:    装配到哪里。过滤 + 位置组合 = "取指定内容,放到指定位置"
   #
-  # ── 能力②:同一仓库 × 多个路径 × 不同子集 = 多条配置 ──────────
-  # 每条配置 = 一个独立 worktree(git worktree 语义:各自独立的
-  # sparse/HEAD/只读状态)。url 相同 → 引擎自动共享同一个镜像缓存
-  # (按 URL 键控,存于 .workspace/git-cache),不重复下载、不占双份磁盘。
+  # ── 同一仓库 × 多个路径 × 不同子集 = 多条配置 ────────────────────
+  # 每条配置 = 一个独立 worktree(各自独立的过滤/HEAD/只读状态)。
+  # url 相同 → 引擎自动共享同一个镜像缓存,不重复下载。
   fastjson2-core:
     url: git@github.com:alibaba/fastjson2.git
     revision: 2.0.63               # 钉 tag:版本快照
     path: frameworks/fastjson2-core
-    sparse: [core]                 # 只要 core 模块
+    include: [core]                # 白名单:只要 core 模块
     readonly: true                 # 三方依赖:文件系统只读
 
   fastjson2-ext:
     url: git@github.com:alibaba/fastjson2.git   # 同一个仓库
     revision: 2.0.63                            # 同一版本(也可不同)
     path: frameworks/fastjson2-ext              # 不同装配位置
-    sparse: [extension]                         # 不同子集
+    include: [extension]                        # 不同子集
+    # exclude: [core/src/test]                  # 黑名单写法示例(与 include 互斥)
     readonly: true
